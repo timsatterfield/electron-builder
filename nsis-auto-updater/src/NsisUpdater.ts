@@ -6,14 +6,12 @@ import { gt as isVersionGreaterThan, valid as parseVersion } from "semver"
 import { download } from "../../src/util/httpRequest"
 import { Provider, UpdateCheckResult } from "./api"
 import { BintrayProvider } from "./BintrayProvider"
-import BluebirdPromise from "bluebird"
-import { BintrayOptions, PublishConfiguration, GithubOptions } from "../../src/options/publishOptions"
-import { readJson } from "fs-extra-p"
-
-BluebirdPromise.config({
-  longStackTraces: true,
-  cancellation: true
-})
+import BluebirdPromise from "bluebird-lst-c"
+import { BintrayOptions, PublishConfiguration, GithubOptions, GenericServerOptions } from "../../src/options/publishOptions"
+import { readFile } from "fs-extra-p"
+import { safeLoad } from "js-yaml"
+import { GenericProvider } from "./GenericProvider"
+import { GitHubProvider } from "./GitHubProvider"
 
 export class NsisUpdater extends EventEmitter {
   private setupPath: string | null
@@ -21,9 +19,11 @@ export class NsisUpdater extends EventEmitter {
   private updateAvailable = false
   private quitAndInstallCalled = false
 
-  private clientPromise: Promise<Provider>
+  private clientPromise: Promise<Provider<any>>
 
   private readonly app: any
+
+  private quitHandlerAdded = false
 
   constructor(options?: PublishConfiguration | BintrayOptions | GithubOptions) {
     super()
@@ -31,7 +31,7 @@ export class NsisUpdater extends EventEmitter {
     this.app = (<any>global).__test_app || require("electron").app
 
     if (options == null) {
-      this.clientPromise = loadUpdateConfig()
+      this.clientPromise = this.loadUpdateConfig()
     }
     else {
       this.setFeedURL(options)
@@ -42,20 +42,26 @@ export class NsisUpdater extends EventEmitter {
     return JSON.stringify(this.clientPromise, null, 2)
   }
 
-  setFeedURL(value: string | PublishConfiguration | BintrayOptions | GithubOptions) {
+  setFeedURL(value: string | PublishConfiguration | BintrayOptions | GithubOptions | GenericServerOptions) {
     this.clientPromise = BluebirdPromise.resolve(createClient(value))
   }
 
-  checkForUpdates(): Promise<UpdateCheckResult> {
+  async checkForUpdates(): Promise<UpdateCheckResult> {
     if (this.clientPromise == null) {
       const message = "Update URL is not set"
-      this.emitError(message)
-      return BluebirdPromise.reject(new Error(message))
+      const error = new Error(message)
+      this.emit("error", error, message)
+      throw error
     }
 
     this.emit("checking-for-update")
-    return this.doCheckForUpdates()
-      .catch(error => this.emitError(error))
+    try {
+      return await this.doCheckForUpdates()
+    }
+    catch (e) {
+      this.emit("error", e, (e.stack || e).toString())
+      throw e
+    }
   }
 
   private async doCheckForUpdates(): Promise<UpdateCheckResult> {
@@ -72,7 +78,7 @@ export class NsisUpdater extends EventEmitter {
       throw new Error(`App version is not valid semver version: "${currentVersion}`)
     }
 
-    if (isVersionGreaterThan(currentVersion, latestVersion)) {
+    if (!isVersionGreaterThan(latestVersion, currentVersion)) {
       this.updateAvailable = false
       this.emit("update-not-available")
       return {
@@ -90,27 +96,50 @@ export class NsisUpdater extends EventEmitter {
       versionInfo: versionInfo,
       fileInfo: fileInfo,
       downloadPromise: mkdtemp(`${path.join(tmpdir(), "up")}-`)
-        .then(it => download(fileInfo.url, path.join(it, fileInfo.name)))
+        .then(it => download(fileInfo.url, path.join(it, fileInfo.name), fileInfo.sha2 == null ? null : {sha2: fileInfo.sha2}))
         .then(it => {
           this.setupPath = it
+          this.addQuitHandler()
           this.emit("update-downloaded", {}, null, versionInfo.version, null, null, () => {
             this.quitAndInstall()
           })
           return it
         })
-        .catch(error => this.emitError(error)),
+        .catch(e => {
+          this.emit("error", e, (e.stack || e).toString())
+          throw e
+        }),
     }
   }
 
-  quitAndInstall(): void {
-    if (this.quitAndInstallCalled) {
+  private addQuitHandler() {
+    if (this.quitHandlerAdded) {
       return
+    }
+
+    this.quitHandlerAdded = true
+
+    this.app.on("quit", () => {
+      this.install()
+    })
+  }
+
+  quitAndInstall(): void {
+    if (this.install()) {
+      this.app.quit()
+    }
+  }
+
+  private install(): boolean {
+    if (this.quitAndInstallCalled) {
+      return false
     }
 
     const setupPath = this.setupPath
     if (!this.updateAvailable || setupPath == null) {
-      this.emitError("No update available, can't quit and install")
-      return
+      const message = "No update available, can't quit and install"
+      this.emit("error", new Error(message), message)
+      return false
     }
 
     // prevent calling several times
@@ -121,12 +150,17 @@ export class NsisUpdater extends EventEmitter {
       stdio: "ignore",
     }).unref()
 
-    this.app.quit()
+    return true
   }
 
-  // emit both error object and message, this is to keep compatibility with old APIs
-  private emitError(message: string) {
-    return this.emit("error", new Error(message), message)
+  async loadUpdateConfig() {
+    try {
+      return createClient(safeLoad(await readFile(path.join((<any>global).__test_resourcesPath || (<any>process).resourcesPath, "app-update.yml"), "utf-8")))
+    }
+    catch (e) {
+      this.emit("error", e, (e.stack || e).toString())
+      throw e
+    }
   }
 }
 
@@ -136,16 +170,11 @@ function createClient(data: string | PublishConfiguration | BintrayOptions | Git
   }
   else {
     const provider = (<PublishConfiguration>data).provider
-    if (provider === "bintray") {
-      return new BintrayProvider(<BintrayOptions>data)
-    }
-    else {
-      throw new Error(`Unsupported provider: ${provider}`)
+    switch (provider) {
+      case "github": return new GitHubProvider(<GithubOptions>data)
+      case "generic": return new GenericProvider(<GenericServerOptions>data)
+      case "bintray":  return new BintrayProvider(<BintrayOptions>data)
+      default: throw new Error(`Unsupported provider: ${provider}`)
     }
   }
-}
-
-async function loadUpdateConfig() {
-  const data = await readJson(path.join((<any>global).__test_resourcesPath || (<any>process).resourcesPath, ".app-update.json"), "utf-8")
-  return createClient(data)
 }

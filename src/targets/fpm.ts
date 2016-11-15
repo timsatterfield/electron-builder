@@ -1,13 +1,15 @@
-import { LinuxBuildOptions, Arch } from "../metadata"
-import { smarten, PlatformPackager, TargetEx } from "../platformPackager"
+import { Arch } from "../metadata"
+import { smarten, TargetEx } from "../platformPackager"
 import { use, exec } from "../util/util"
 import * as path from "path"
 import { getBin } from "../util/binDownload"
 import {  readFile, outputFile } from "fs-extra-p"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { LinuxTargetHelper, installPrefix } from "./LinuxTargetHelper"
 import * as errorMessages from "../errorMessages"
 import { TmpDir } from "../util/tmp"
+import { LinuxPackager } from "../linuxPackager"
+import { log } from "../util/log"
 
 const template = require("lodash.template")
 
@@ -32,8 +34,8 @@ export default class FpmTarget extends TargetEx {
   private readonly scriptFiles: Promise<Array<string>>
   private readonly desktopEntry: Promise<string>
 
-  constructor(name: string, private packager: PlatformPackager<LinuxBuildOptions>, private helper: LinuxTargetHelper, private outDir: string) {
-    super(name)
+  constructor(name: string, private packager: LinuxPackager, private helper: LinuxTargetHelper, private outDir: string) {
+    super(name, false)
 
     this.scriptFiles = this.createScripts()
     this.desktopEntry = helper.computeDesktopEntry(this.options)
@@ -45,7 +47,7 @@ export default class FpmTarget extends TargetEx {
     const packager = this.packager
     const templateOptions = Object.assign({
       // old API compatibility
-      executable: packager.appInfo.productFilename,
+      executable: this.packager.executableName,
     }, packager.platformSpecificBuildOptions)
 
     function getResource(value: string | n, defaultFile: string) {
@@ -55,14 +57,18 @@ export default class FpmTarget extends TargetEx {
       return path.resolve(packager.projectDir, value)
     }
 
-    const afterInstallFilePath = writeConfigFile(packager.info.tempDirManager, getResource(packager.platformSpecificBuildOptions.afterInstall, "after-install.tpl"), templateOptions)
-    const afterRemoveFilePath = writeConfigFile(packager.info.tempDirManager, getResource(packager.platformSpecificBuildOptions.afterRemove, "after-remove.tpl"), templateOptions)
-
-    return await BluebirdPromise.all<string>([afterInstallFilePath, afterRemoveFilePath])
+    //noinspection ES6MissingAwait
+    return await BluebirdPromise.all<string>([
+      writeConfigFile(packager.info.tempDirManager, getResource(packager.platformSpecificBuildOptions.afterInstall, "after-install.tpl"), templateOptions),
+      writeConfigFile(packager.info.tempDirManager, getResource(packager.platformSpecificBuildOptions.afterRemove, "after-remove.tpl"), templateOptions)
+    ])
   }
 
   async build(appOutDir: string, arch: Arch): Promise<any> {
     const target = this.name
+
+    log(`Building ${target}`)
+
     const destination = path.join(this.outDir, this.packager.generateName(target, arch, true /* on Linux we use safe name — without space */))
 
     const scripts = await this.scriptFiles

@@ -1,16 +1,23 @@
 import * as path from "path"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { PlatformPackager, BuildInfo, Target, TargetEx } from "./platformPackager"
-import { Platform, LinuxBuildOptions, Arch } from "./metadata"
+import { Platform, Arch } from "./metadata"
 import FpmTarget from "./targets/fpm"
 import { createCommonTarget, DEFAULT_TARGET } from "./targets/targetFactory"
 import { LinuxTargetHelper } from "./targets/LinuxTargetHelper"
 import AppImageTarget from "./targets/appImage"
 import { rename } from "fs-extra-p"
+import { LinuxBuildOptions } from "./options/linuxOptions"
+import sanitizeFileName from "sanitize-filename"
 
 export class LinuxPackager extends PlatformPackager<LinuxBuildOptions> {
+  readonly executableName: string
+
   constructor(info: BuildInfo) {
     super(info)
+
+    let executableName = this.platformSpecificBuildOptions.executableName
+    this.executableName = sanitizeFileName(executableName == null ? this.appInfo.name : executableName)
   }
 
   normalizePlatformSpecificBuildOptions(options: LinuxBuildOptions | n): LinuxBuildOptions {
@@ -63,31 +70,29 @@ export class LinuxPackager extends PlatformPackager<LinuxBuildOptions> {
   }
 
   protected postInitApp(appOutDir: string): Promise<any> {
-    return rename(path.join(appOutDir, "electron"), path.join(appOutDir, this.appInfo.productFilename))
+    return rename(path.join(appOutDir, "electron"), path.join(appOutDir, this.executableName))
   }
 
   protected async packageInDistributableFormat(outDir: string, appOutDir: string, arch: Arch, targets: Array<Target>): Promise<any> {
     // todo fix fpm - if run in parallel, get strange tar errors
+    // https://github.com/electron-userland/electron-builder/issues/460
+    // for some reasons in parallel to fmp we cannot use tar
     for (let t of targets) {
-      if (t instanceof TargetEx) {
+      if (t instanceof TargetEx && !t.isAsyncSupported) {
         await t.build(appOutDir, arch)
       }
     }
 
-    const promises: Array<Promise<any>> = []
-    // https://github.com/electron-userland/electron-builder/issues/460
-    // for some reasons in parallel to fmp we cannot use tar
-    for (let t of targets) {
-      const target = t.name
+    await BluebirdPromise.map(targets, it => {
+      const target = it.name
       if (target === "zip" || target === "7z" || target.startsWith("tar.")) {
         const destination = path.join(outDir, this.generateName(target, arch, true))
-        promises.push(this.archiveApp(target, appOutDir, destination)
-          .then(() => this.dispatchArtifactCreated(destination)))
+        return this.archiveApp(target, appOutDir, destination)
+          .then(() => this.dispatchArtifactCreated(destination))
       }
-    }
-
-    if (promises.length > 0) {
-      await BluebirdPromise.all(promises)
-    }
+      else {
+        return it instanceof TargetEx && it.isAsyncSupported ? it.build(appOutDir, arch) : null
+      }
+    })
   }
 }

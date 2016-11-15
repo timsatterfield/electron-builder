@@ -12,6 +12,7 @@
     "strictNullChecks": true,
     "noEmitHelpers": true,
     "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
     "skipLibCheck": true
   },
   "declaration": {
@@ -20,9 +21,10 @@
   },
   "files": [
     "../typings/semver.d.ts",
+    "../typings/debug.d.ts",
     "../node_modules/@types/node/index.d.ts",
     "../node_modules/fs-extra-p/index.d.ts",
-    "../node_modules/@develar/types/bluebird.d.ts",
+    "../node_modules/bluebird-lst-c/index.d.ts",
     "../src/util/httpRequest.ts",
     "../src/publish/restApiRequest.ts",
     "../src/publish/restApiRequest.ts",

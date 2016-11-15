@@ -4,10 +4,10 @@ import OsXPackager from "out/macPackager"
 import { writeFile, remove, copy, mkdir } from "fs-extra-p"
 import * as path from "path"
 import { BuildInfo } from "out/platformPackager"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { assertThat } from "./helpers/fileAssert"
 import { Platform, MacOptions, createTargets } from "out"
-import { SignOptions, FlatOptions } from "electron-osx-sign-tf"
+import { SignOptions } from "electron-macos-sign"
 import { Arch } from "out"
 import { Target } from "out/platformPackager"
 import { DmgTarget } from "out/targets/dmg"
@@ -15,12 +15,13 @@ import { DIR_TARGET } from "out/targets/targetFactory"
 import { attachAndExecute } from "out/targets/dmg"
 import { getTempName } from "out/util/util"
 import { exec } from "out/util/util"
+import { MacOsTargetName } from "out/options/macOptions"
 
 test.ifOsx("two-package", () => assertPack("test-app", {targets: createTargets([Platform.MAC], null, "all")}, {signed: true, useTempDir: true}))
 
 test.ifOsx("one-package", app(platform(Platform.MAC), {signed: true}))
 
-function createTargetTest(target: Array<string>, expectedContents: Array<string>) {
+function createTargetTest(target: Array<MacOsTargetName>, expectedContents: Array<string>) {
   return app({
     targets: Platform.MAC.createTarget(),
     devMetadata: {
@@ -33,7 +34,7 @@ function createTargetTest(target: Array<string>, expectedContents: Array<string>
   }, {
     useTempDir: true,
     expectedContents: expectedContents,
-    signed: target.includes("mas"),
+    signed: target.includes("mas") || target.includes("pkg"),
     packed: async (context) => {
       if (!target.includes("tar.gz")) {
         return
@@ -49,12 +50,14 @@ function createTargetTest(target: Array<string>, expectedContents: Array<string>
 
 test("only zip", createTargetTest(["zip"], ["Test App ßW-1.1.0-mac.zip"]))
 
+test.ifOsx("pkg", createTargetTest(["pkg"], ["Test App ßW-1.1.0.pkg"]))
+
 test("tar.gz", createTargetTest(["tar.gz"], ["Test App ßW-1.1.0-mac.tar.gz"]))
 
 // todo failed on Travis CI
 //test("tar.xz", createTargetTest(["tar.xz"], ["Test App ßW-1.1.0-mac.tar.xz"]))
 
-test.ifOsx("invalid target", t => t.throws(createTargetTest(["ttt"], [])(), "Unknown target: ttt"))
+test.ifOsx("invalid target", t => t.throws(createTargetTest([<any>"ttt"], [])(), "Unknown target: ttt"))
 
 if (process.env.CSC_KEY_PASSWORD == null || process.platform !== "darwin") {
   console.warn("Skip mas tests because CSC_KEY_PASSWORD is not defined")
@@ -144,6 +147,7 @@ test.ifOsx("no background", app({
       productName: "Test ß",
       dmg: {
         background: null,
+        title: "Foo",
       },
     }
   }
@@ -183,30 +187,6 @@ test.ifOsx("no build directory", app(platform(Platform.MAC), {
   projectDirCreated: projectDir => remove(path.join(projectDir, "build"))
 }))
 
-test.ifOsx("custom background - old way", () => {
-  let platformPackager: CheckingMacPackager = null
-  const customBackground = "customBackground.tiff"
-  return assertPack("test-app-one", {
-    targets: Platform.MAC.createTarget(),
-    platformPackagerFactory: (packager, platform, cleanupTasks) => platformPackager = new CheckingMacPackager(packager)
-  }, {
-    projectDirCreated: projectDir => BluebirdPromise.all([
-      copy(path.join(__dirname, "..", "..", "templates", "dmg", "background.tiff"), path.join(projectDir, customBackground)),
-      modifyPackageJson(projectDir, data => {
-        data.build.osx = {
-          background: customBackground,
-          icon: "foo.icns",
-        }
-      })
-    ]),
-    packed: () => {
-      assertThat(platformPackager.effectiveDistOptions.background).isEqualTo(customBackground)
-      assertThat(platformPackager.effectiveDistOptions.icon).isEqualTo("foo.icns")
-      return BluebirdPromise.resolve(null)
-    },
-  })
-})
-
 test.ifOsx("custom background - new way", () => {
   let platformPackager: CheckingMacPackager = null
   const customBackground = "customBackground.png"
@@ -224,11 +204,6 @@ test.ifOsx("custom background - new way", () => {
         data.build.dmg = {
           background: customBackground,
           icon: "foo.icns",
-        }
-
-        data.build.osx = {
-          background: null,
-          icon: "ignoreMe.icns",
         }
       })
     ]),
@@ -275,7 +250,6 @@ test.ifOsx("electronDist", appThrows(/ENOENT: no such file or directory/, {
 class CheckingMacPackager extends OsXPackager {
   effectiveDistOptions: any
   effectiveSignOptions: SignOptions
-  effectiveFlatOptions: FlatOptions
 
   constructor(info: BuildInfo) {
     super(info)
@@ -301,8 +275,8 @@ class CheckingMacPackager extends OsXPackager {
     this.effectiveSignOptions = opts
   }
 
-  async doFlat(opts: FlatOptions): Promise<any> {
-    this.effectiveFlatOptions = opts
+  async doFlat(appPath: string, outFile: string, identity: string, keychain?: string | null): Promise<any> {
+    // skip
   }
 
   packageInDistributableFormat(appOutDir: string, targets: Array<Target>, promises: Array<Promise<any>>): void {

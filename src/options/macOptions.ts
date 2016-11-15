@@ -1,5 +1,7 @@
 import { PlatformSpecificBuildOptions } from "../metadata"
 
+export type MacOsTargetName = "default" | "dmg" | "mas" | "pkg" | "7z" | "zip" | "tar.xz" | "tar.lz" | "tar.gz" | "tar.bz2" | "dir"
+
 /*
  ### `.build.mac`
 
@@ -16,9 +18,9 @@ export interface MacOptions extends PlatformSpecificBuildOptions {
   readonly category?: string | null
 
   /*
-   Target package type: list of `default`, `dmg`, `mas`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`. Defaults to `default` (dmg and zip for Squirrel.Mac).
+   The target package type: list of `default`, `dmg`, `mas`, `pkg`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`. Defaults to `default` (dmg and zip for Squirrel.Mac).
   */
-  readonly target?: Array<string> | null
+  readonly target?: Array<MacOsTargetName> | null
 
   /*
    The name of certificate to use when signing. Consider using environment variables [CSC_LINK or CSC_NAME](https://github.com/electron-userland/electron-builder/wiki/Code-Signing).
@@ -89,6 +91,13 @@ export interface DmgOptions {
   The size of all the icon texts inside the DMG. Defaults to 12.
    */
   readonly iconTextSize?: number | null
+
+  /*
+  The title of the produced DMG, which will be shown when mounted (volume name). Defaults to `${productName} ${version}`
+
+  Macro `${productName}`, `${version}` and `${name}` are supported.
+   */
+  readonly title?: string | null
 
   /*
   The content — to customize icon locations.

@@ -1,9 +1,9 @@
 import { readdir, outputFile, ensureDir } from "fs-extra-p"
 import * as path from "path"
 import { exec, debug, isEmptyOrSpaces } from "../util/util"
-import { PlatformPackager } from "../platformPackager"
-import BluebirdPromise from "bluebird"
-import { LinuxBuildOptions } from "../metadata"
+import BluebirdPromise from "bluebird-lst-c"
+import { LinuxBuildOptions } from "../options/linuxOptions"
+import { LinuxPackager } from "../linuxPackager"
 
 export const installPrefix = "/opt"
 
@@ -12,7 +12,7 @@ export class LinuxTargetHelper {
 
   maxIconPath: string | null = null
 
-  constructor(private packager: PlatformPackager<LinuxBuildOptions>) {
+  constructor(private packager: LinuxPackager) {
     this.icons = this.computeDesktopIcons()
   }
 
@@ -20,10 +20,10 @@ export class LinuxTargetHelper {
   private async computeDesktopIcons(): Promise<Array<Array<string>>> {
     const resourceList = await this.packager.resourceList
     if (resourceList.includes("icons")) {
-      return this.iconsFromDir(path.join(this.packager.buildResourcesDir, "icons"))
+      return await this.iconsFromDir(path.join(this.packager.buildResourcesDir, "icons"))
     }
     else {
-      return this.createFromIcns(await this.packager.getTempFile("electron-builder-linux.iconset").then(it => ensureDir(it).thenReturn(it)))
+      return await this.createFromIcns(await this.packager.getTempFile("electron-builder-linux.iconset").then(it => ensureDir(it).thenReturn(it)))
     }
   }
 
@@ -72,7 +72,7 @@ export class LinuxTargetHelper {
     const desktopMeta: any = Object.assign({
       Name: appInfo.productName,
       Comment: platformSpecificBuildOptions.description || appInfo.description,
-      Exec: exec == null ? `"${installPrefix}/${productFilename}/${productFilename}"` : exec,
+      Exec: exec == null ? `"${installPrefix}/${productFilename}/${this.packager.executableName}"` : exec,
       Terminal: "false",
       Type: "Application",
       Icon: appInfo.name,
@@ -97,7 +97,7 @@ export class LinuxTargetHelper {
   private async createFromIcns(tempDir: string): Promise<Array<Array<string>>> {
     const iconPath = await this.getIcns()
     if (iconPath == null) {
-      return this.iconsFromDir(path.join(__dirname, "..", "..", "templates", "linux", "electron-icons"))
+      return await this.iconsFromDir(path.join(__dirname, "..", "..", "templates", "linux", "electron-icons"))
     }
 
     if (process.platform === "darwin") {

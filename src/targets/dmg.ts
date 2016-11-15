@@ -1,24 +1,26 @@
 import { deepAssign } from "../util/deepAssign"
 import * as path from "path"
 import { log, warn } from "../util/log"
-import { Target, PlatformPackager } from "../platformPackager"
+import { PlatformPackager, TargetEx } from "../platformPackager"
 import { MacOptions, DmgOptions, DmgContent } from "../options/macOptions"
-import BluebirdPromise from "bluebird"
-import { debug, use, exec, statOrNull, isEmptyOrSpaces } from "../util/util"
+import BluebirdPromise from "bluebird-lst-c"
+import { debug, use, exec, statOrNull, isEmptyOrSpaces, spawn, exists } from "../util/util"
 import { copy, unlink, outputFile, remove } from "fs-extra-p"
 import { executeFinally } from "../util/promise"
+import sanitizeFileName from "sanitize-filename"
+import { Arch } from "../metadata"
 
-export class DmgTarget extends Target {
+export class DmgTarget extends TargetEx {
   private helperDir = path.join(__dirname, "..", "..", "templates", "dmg")
 
   constructor(private packager: PlatformPackager<MacOptions>) {
     super("dmg")
   }
 
-  async build(appOutDir: string) {
+  async build(appOutDir: string, arch: Arch) {
     const packager = this.packager
     const appInfo = packager.appInfo
-    log("Creating DMG")
+    log("Building DMG")
 
     const specification = await this.computeDmgOptions()
 
@@ -27,7 +29,7 @@ export class DmgTarget extends Target {
     const backgroundDir = path.join(tempDir, ".background")
     const backgroundFilename = specification.background == null ? null : path.basename(specification.background)
     if (backgroundFilename != null) {
-      await copy(specification.background!, path.join(backgroundDir, backgroundFilename))
+      await copy(path.resolve(packager.info.projectDir, specification.background!), path.join(backgroundDir, backgroundFilename))
     }
 
     let preallocatedSize = 32 * 1024
@@ -41,19 +43,18 @@ export class DmgTarget extends Target {
     // allocate space for .DS_Store
     await outputFile(path.join(backgroundDir, "DSStorePlaceHolder"), new Buffer(preallocatedSize))
 
-    const volumeName = `${appInfo.productFilename} ${appInfo.version}`
+    const volumeName = sanitizeFileName(this.computeVolumeName(specification.title))
     //noinspection SpellCheckingInspection
-    await exec("hdiutil", ["create",
+    await spawn("hdiutil", addVerboseIfNeed(["create",
       "-srcfolder", backgroundDir,
       "-srcfolder", path.join(appOutDir, `${packager.appInfo.productFilename}.app`),
       "-volname", volumeName,
-      "-anyowners", "-nospotlight", "-quiet", "-fs", "HFS+", "-fsargs", "-c c=64,a=16,e=16",
+      "-anyowners", "-nospotlight", "-fs", "HFS+", "-fsargs", "-c c=64,a=16,e=16",
       "-format", "UDRW",
-      tempDmg,
-    ])
+    ]).concat(tempDmg))
 
     const volumePath = path.join("/Volumes", volumeName)
-    if (await statOrNull(volumePath) != null) {
+    if (await exists(volumePath)) {
       debug("Unmounting previous disk image")
       await detach(volumePath)
     }
@@ -151,10 +152,22 @@ export class DmgTarget extends Target {
 
     const artifactPath = path.join(appOutDir, `${appInfo.productFilename}-${appInfo.version}.dmg`)
     //noinspection SpellCheckingInspection
-    await exec("hdiutil", ["convert", tempDmg, "-format", packager.devMetadata.build.compression === "store" ? "UDRO" : "UDBZ", "-imagekey", "zlib-level=9", "-o", artifactPath])
-    await exec("hdiutil", ["internet-enable", "-no", artifactPath])
+    await spawn("hdiutil", addVerboseIfNeed(["convert", tempDmg, "-format", packager.devMetadata.build.compression === "store" ? "UDRO" : "UDBZ", "-imagekey", "zlib-level=9", "-o", artifactPath]))
+    await exec("hdiutil", addVerboseIfNeed(["internet-enable", "-no"]).concat(artifactPath))
 
     this.packager.dispatchArtifactCreated(artifactPath, `${appInfo.name}-${appInfo.version}.dmg`)
+  }
+
+  computeVolumeName(custom?: string | null): string {
+    const appInfo = this.packager.appInfo
+    if (custom == null) {
+      return `${appInfo.productFilename} ${appInfo.version}`
+    }
+
+    return custom
+      .replace(/\$\{version}/g, appInfo.version)
+      .replace(/\$\{name}/g, appInfo.name)
+      .replace(/\$\{productName}/g, appInfo.productName)
   }
 
   // public to test
@@ -165,7 +178,7 @@ export class DmgTarget extends Target {
         x: 400,
         y: 100,
       },
-    }, Object.assign({}, this.packager.devMetadata.build.osx, packager.devMetadata.build.dmg))
+    }, packager.devMetadata.build.dmg)
 
     // appdmg
     const oldPosition = specification.window.position
@@ -185,15 +198,6 @@ export class DmgTarget extends Target {
         specification.iconSize = specification["icon-size"]
       }
       warn("dmg.icon-size is deprecated, please use dmg.iconSize instead")
-    }
-
-    if (specification.title != null) {
-      if (specification.title === packager.appInfo.productName) {
-        warn(`Do not specify unnecessary dmg.title ("${specification.title}") — application name ("${packager.appInfo.productFilename}") is used by default`)
-      }
-      else {
-        warn("dmg.title is not supported, file issue if need")
-      }
     }
 
     if (!("icon" in specification)) {
@@ -263,8 +267,12 @@ export async function attachAndExecute(dmgPath: string, readWrite: boolean, task
   if (readWrite) {
     args.push("-readwrite")
   }
+
+  // otherwise hangs
+  // addVerboseIfNeed(args)
+
   args.push(dmgPath)
-  const attachResult = await exec("hdiutil", args, {maxBuffer: 1024 * 1024})
+  const attachResult = await exec("hdiutil", args, {maxBuffer: 2 * 1024 * 1024})
   const deviceResult = attachResult == null ? null : /^(\/dev\/\w+)/.exec(attachResult)
   const device = deviceResult == null || deviceResult.length !== 2 ? null : deviceResult[1]
   if (device == null) {
@@ -272,4 +280,11 @@ export async function attachAndExecute(dmgPath: string, readWrite: boolean, task
   }
 
   await executeFinally(task(), () => detach(device))
+}
+
+function addVerboseIfNeed(args: Array<string>): Array<string> {
+  if (process.env.DEBUG_DMG === "true") {
+    args.push("-verbose")
+  }
+  return args
 }

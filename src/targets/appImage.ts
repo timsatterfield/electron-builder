@@ -1,12 +1,14 @@
-import {  PlatformPackager, TargetEx } from "../platformPackager"
-import { LinuxBuildOptions, Arch } from "../metadata"
+import { TargetEx } from "../platformPackager"
+import { Arch } from "../metadata"
 import * as path from "path"
 import { exec, unlinkIfExists } from "../util/util"
 import { open, write, createReadStream, createWriteStream, close, chmod } from "fs-extra-p"
 import { LinuxTargetHelper } from "./LinuxTargetHelper"
 import { getBin } from "../util/binDownload"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { v1 as uuid1 } from "uuid-1345"
+import { LinuxPackager } from "../linuxPackager"
+import { log } from "../util/log"
 
 const appImageVersion = process.platform === "darwin" ? "AppImage-09-07-16-mac" : "AppImage-09-07-16-linux"
 //noinspection SpellCheckingInspection
@@ -18,7 +20,7 @@ export default class AppImageTarget extends TargetEx {
   private readonly options = Object.assign({}, this.packager.platformSpecificBuildOptions, (<any>this.packager.devMetadata.build)[this.name])
   private readonly desktopEntry: Promise<string>
 
-  constructor(private packager: PlatformPackager<LinuxBuildOptions>, private helper: LinuxTargetHelper, private outDir: string) {
+  constructor(private packager: LinuxPackager, private helper: LinuxTargetHelper, private outDir: string) {
     super("appImage")
 
     // we add X-AppImage-BuildId to ensure that new desktop file will be installed
@@ -30,15 +32,15 @@ export default class AppImageTarget extends TargetEx {
   }
 
   async build(appOutDir: string, arch: Arch): Promise<any> {
+    log(`Building AppImage`)
+
     const packager = this.packager
 
     // avoid spaces in the file name
     const image = path.join(this.outDir, packager.generateName("AppImage", arch, true))
-    const appInfo = packager.appInfo
     await unlinkIfExists(image)
 
     const appImagePath = await appImagePathPromise
-    const appExecutableImagePath = `/usr/bin/${appInfo.name}`
     const args = [
       "-joliet", "on",
       "-volid", "AppImage",
@@ -46,10 +48,8 @@ export default class AppImageTarget extends TargetEx {
       "-padding", "0",
       "-map", appOutDir, "/usr/bin",
       "-map", path.join(__dirname, "..", "..", "templates", "linux", "AppRun.sh"), "/AppRun",
-      "-map", await this.desktopEntry, `/${appInfo.name}.desktop`,
-      "-move", `/usr/bin/${appInfo.productFilename}`, appExecutableImagePath,
-      // http://stackoverflow.com/questions/13633488/can-i-store-unix-permissions-in-a-zip-file-built-with-apache-ant, xorriso doesn't preserve it for zip, but we set it in any case
-      "-chmod", "+x", "/AppRun", appExecutableImagePath, "--",
+      // we get executable name in the AppRun by desktop file name, so, must be named as executable
+      "-map", await this.desktopEntry, `/${this.packager.executableName}.desktop`,
     ]
     for (let [from, to] of (await this.helper.icons)) {
       args.push("-map", from, `/usr/share/icons/default/${to}`)

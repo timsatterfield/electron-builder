@@ -3,7 +3,7 @@ import { PackagerOptions, getPublishConfigs, getResolvedPublishConfig } from "./
 import { PublishOptions, Publisher } from "./publish/publisher"
 import { GitHubPublisher } from "./publish/gitHubPublisher"
 import { executeFinally } from "./util/promise"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { isEmptyOrSpaces, isCi, debug } from "./util/util"
 import { log } from "./util/log"
 import { Platform, Arch, archFromString } from "./metadata"
@@ -148,7 +148,6 @@ export function normalizeOptions(args: CliOptions): BuildOptions {
   delete r.l
   delete r.w
   delete r.windows
-  delete r.osx
   delete r.macos
   delete r.$0
   delete r._
@@ -175,7 +174,7 @@ export function createTargets(platforms: Array<Platform>, type?: string | null, 
   return targets
 }
 
-export async function build(rawOptions?: CliOptions): Promise<void> {
+export async function build(rawOptions?: CliOptions): Promise<Array<string>> {
   const options = normalizeOptions(rawOptions || {})
 
   if (options.cscLink === undefined && !isEmptyOrSpaces(process.env.CSC_LINK)) {
@@ -231,7 +230,14 @@ export async function build(rawOptions?: CliOptions): Promise<void> {
     }
   }
 
-  await executeFinally(packager.build(), errorOccurred => {
+  const artifactPaths: Array<string> = []
+  packager.artifactCreated(event => {
+    if (event.file != null) {
+      artifactPaths.push(event.file)
+    }
+  })
+
+  return await executeFinally(packager.build().then(() => artifactPaths), errorOccurred => {
     if (errorOccurred) {
       for (let task of publishTasks) {
         task!.cancel()
@@ -250,8 +256,18 @@ function isAuthTokenSet() {
 
 function publishManager(packager: Packager, publishTasks: Array<BluebirdPromise<any>>, options: BuildOptions, isPublishOptionGuessed: boolean) {
   const nameToPublisher = new Map<string, Promise<Publisher>>()
+
+  function getOrCreatePublisher(publishConfig: PublishConfiguration): Promise<Publisher | null> {
+    let publisher = nameToPublisher.get(publishConfig.provider)
+    if (publisher == null) {
+      publisher = createPublisher(packager, publishConfig, options, isPublishOptionGuessed)
+      nameToPublisher.set(publishConfig.provider, publisher)
+    }
+    return publisher
+  }
+
   packager.artifactCreated(event => {
-    const publishers = getPublishConfigs(event.packager, event.packager.platformSpecificBuildOptions)
+    const publishers = event.publishConfig == null ? getPublishConfigs(event.packager, event.packager.platformSpecificBuildOptions) : [event.publishConfig]
     // if explicitly set to null - do not publish
     if (publishers === null) {
       debug(`${event.file} is not published: publish is set to null`)
@@ -259,16 +275,21 @@ function publishManager(packager: Packager, publishTasks: Array<BluebirdPromise<
     }
 
     for (let publishConfig of publishers) {
-      const provider = publishConfig.provider
-      let publisher = nameToPublisher.get(provider)
-      if (publisher == null) {
-        publisher = createPublisher(packager, publishConfig, options, isPublishOptionGuessed)
-        nameToPublisher.set(provider, publisher)
-      }
-
+      const publisher = getOrCreatePublisher(publishConfig)
       if (publisher != null) {
         publisher
-          .then(it => it == null ? null : publishTasks.push(<BluebirdPromise<any>>it.upload(event.file, event.artifactName)))
+          .then(it => {
+            if (it == null) {
+              return null
+            }
+
+            if (event.file == null) {
+              return publishTasks.push(<BluebirdPromise<any>>it.uploadData(event.data!, event.artifactName!))
+            }
+            else {
+              return publishTasks.push(<BluebirdPromise<any>>it.upload(event.file!, event.artifactName))
+            }
+          })
       }
     }
   })
@@ -290,7 +311,7 @@ export async function createPublisher(packager: Packager, publishConfig: Publish
   }
   if (publishConfig.provider === "bintray") {
     const bintrayInfo: BintrayOptions = config
-    log(`Creating Bintray Publisher — user: ${bintrayInfo.owner}, package: ${bintrayInfo.package}, repository: ${bintrayInfo.repo}, version: ${version}`)
+    log(`Creating Bintray Publisher — user: ${bintrayInfo.user || bintrayInfo.owner}, owner: ${bintrayInfo.owner},  package: ${bintrayInfo.package}, repository: ${bintrayInfo.repo}, version: ${version}`)
     return new BintrayPublisher(bintrayInfo, version, options)
   }
   return null

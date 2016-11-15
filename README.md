@@ -2,42 +2,22 @@
 A complete solution to package and build a ready for distribution Electron app for MacOS, Windows and Linux with “auto update” support out of the box.
 
 * NPM packages management:
-  * [Native application dependencies](http://electron.atom.io/docs/latest/tutorial/using-native-node-modules/) compilation (only if the [two-package.json project structure](#two-packagejson-structure) is used).
+  * [Native application dependencies](http://electron.atom.io/docs/latest/tutorial/using-native-node-modules/) compilation.
   * Development dependencies are never included. You don't need to ignore them explicitly.
 * [Code Signing](https://github.com/electron-userland/electron-builder/wiki/Code-Signing) on a CI server or development machine.
 * [Auto Update](#auto-update) ready application packaging.
 * [Build version management](https://github.com/electron-userland/electron-builder/wiki/Options#build-version-management).
 * Numerous target formats:
   * All platforms: `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir` (unpacked directory).
-  * [MacOS](https://github.com/electron-userland/electron-builder/wiki/Options#MacOptions-target): `dmg`, `mas`.
+  * [MacOS](https://github.com/electron-userland/electron-builder/wiki/Options#MacOptions-target): `dmg`, `pkg`, `mas`.
   * [Linux](https://github.com/electron-userland/electron-builder/wiki/Options#LinuxBuildOptions-target): `AppImage`, `deb`, `rpm`, `freebsd`, `pacman`, `p5p`, `apk`.
   * [Windows](https://github.com/electron-userland/electron-builder/wiki/Options#WinBuildOptions-target): NSIS, Squirrel.Windows.
+* [Two package.json Structure](https://github.com/electron-userland/electron-builder/wiki/Two-package.json-Structure) is supported, but you are not forced to use it even if you have native production dependencies.  
 * [Publishing artifacts](https://github.com/electron-userland/electron-builder/wiki/Publishing-Artifacts) to GitHub Releases and Bintray.
 
 _Note: Platform specific `7zip-bin-*` packages are `optionalDependencies`, which may require manual install if you have npm configured to [not install optional deps by default](https://docs.npmjs.com/misc/config#optional)._
 
 Real project example — [onshape-desktop-shell](https://github.com/develar/onshape-desktop-shell).
-
-Consider to use `nsis` target for Windows ([auto-update](https://github.com/electron-userland/electron-builder/issues/529) will be implemented this month) for new projects.
-
-# Two package.json structure
-
-We recommend to use two package.json files (it is not required, you can build your project with any structure).
-
-1. For development (`./package.json`)
-
-   The `package.json` resides in the root of your project. Here you declare the dependencies for your development environment and build scripts (`devDependencies`).
-
-2. For your application (`./app/package.json`)
-
-   The `package.json` resides in the `app` directory. Declare your application dependencies (`depencencies`) here. *Only this directory is distributed with the final, packaged application.*
-
-Why?
-
-1. Native npm modules (those written in C, not JavaScript) need to be compiled and here we have two different compilation targets for them. Those used within the application need to be compiled against the electron runtime and all `devDependencies` need to be compiled against your local node.js environment. Thanks to the two `package.json` structure, this is trivial (see [#39](https://github.com/electron-userland/electron-builder/issues/39)).
-2. No need to specify which [files](https://github.com/electron-userland/electron-builder/wiki/Options#BuildMetadata-files) to include in the app (because development files reside outside the `app` directory).
-
-Please see [Loading App Dependencies Manually](https://github.com/electron-userland/electron-builder/wiki/Loading-App-Dependencies-Manually) and [#379](https://github.com/electron-userland/electron-builder/issues/379#issuecomment-218503881).
 
 # Configuration
 
@@ -76,8 +56,7 @@ For an app that will be shipped to production, you should sign your application.
     ```
     Then you can run `npm run dist` (to package in a distributable format (e.g. dmg, windows installer, deb package)) or `npm run pack` (only generates the package directory without really packaging it. This is useful for testing purposes).
 
-    If you use the [two-package.json project structure](#two-packagejson-structure), you'll only have your `devDependencies` in your development `package.json` and your `dependencies` in your app `package.json`. To ensure your dependencies are always updated based on both files, simply add `"postinstall": "install-app-deps"` to your development `package.json`. This will basically automatically trigger an `npm install` within your app directory so you don't have to do this work everytime you install/update your dependencies.
-	
+    To ensure your native dependencies are always matched electron version, simply add `"postinstall": "install-app-deps"` to your `package.json`. [Do not use Yarn.](https://github.com/yarnpkg/yarn/issues/1749) 
 
 5. If you have native addons of your own that are part of the application (not as a dependency), add `"nodeGypRebuild": true` to the `build` section of your development `package.json`.  
    :bulb: Don't [use](https://github.com/electron-userland/electron-builder/issues/683#issuecomment-241214075) [npm](http://electron.atom.io/docs/tutorial/using-native-node-modules/#using-npm) (neither `.npmrc`) for configuring electron headers. Use [node-gyp-rebuild](https://github.com/electron-userland/electron-builder/issues/683#issuecomment-241488783) bin instead.

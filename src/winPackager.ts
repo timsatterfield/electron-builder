@@ -1,9 +1,9 @@
 import { downloadCertificate } from "./codeSign"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { PlatformPackager, BuildInfo, Target, TargetEx } from "./platformPackager"
 import { Platform, Arch } from "./metadata"
 import * as path from "path"
-import { log, task } from "./util/log"
+import { log } from "./util/log"
 import { exec, use } from "./util/util"
 import { open, close, read } from "fs-extra-p"
 import { sign, SignOptions, getSignVendorPath } from "./windowsCodeSign"
@@ -32,7 +32,7 @@ export class WinPackager extends PlatformPackager<WinBuildOptions> {
     if (subjectName == null) {
       const certificateFile = this.platformSpecificBuildOptions.certificateFile
       if (certificateFile != null) {
-        const certificatePassword = this.platformSpecificBuildOptions.certificatePassword || this.getCscPassword()
+        const certificatePassword = this.getCscPassword()
         this.cscInfo = BluebirdPromise.resolve({
           file: certificateFile,
           password: certificatePassword == null ? null : certificatePassword.trim(),
@@ -63,19 +63,23 @@ export class WinPackager extends PlatformPackager<WinBuildOptions> {
     this.iconPath = this.getValidIconPath()
   }
 
+  protected doGetCscPassword(): string {
+    return this.platformSpecificBuildOptions.certificatePassword || process.env.WIN_CSC_KEY_PASSWORD || super.doGetCscPassword()
+  }
+
   createTargets(targets: Array<string>, mapper: (name: string, factory: (outDir: string) => Target) => void, cleanupTasks: Array<() => Promise<any>>): void {
     for (let name of targets) {
       if (name === DIR_TARGET) {
         continue
       }
 
-      if (name === DEFAULT_TARGET || name === "squirrel") {
+      if (name === "squirrel") {
         mapper("squirrel", () => {
           const targetClass: typeof SquirrelWindowsTarget = require("./targets/squirrelWindows").default
           return new targetClass(this)
         })
       }
-      else if (name === "nsis") {
+      else if (name === DEFAULT_TARGET || name === "nsis") {
         mapper(name, outDir => {
           const targetClass: typeof NsisTarget = require("./targets/nsis").default
           return new targetClass(this, outDir)
@@ -136,7 +140,7 @@ export class WinPackager extends PlatformPackager<WinBuildOptions> {
   }
 
   //noinspection JSMethodCanBeStatic
-  protected async doSign(options: SignOptions): Promise<any> {
+  protected doSign(options: SignOptions): Promise<any> {
     return sign(options)
   }
 
@@ -177,11 +181,11 @@ export class WinPackager extends PlatformPackager<WinBuildOptions> {
   protected packageInDistributableFormat(outDir: string, appOutDir: string, arch: Arch, targets: Array<Target>, promises: Array<Promise<any>>): void {
     for (let target of targets) {
       if (target instanceof TargetEx) {
-        promises.push(task(`Building ${target.name} ${Arch[arch]} installer`, target.build(appOutDir, arch)))
+        promises.push(target.build(appOutDir, arch))
       }
       else {
         const format = target.name
-        log(`Creating Windows ${format}`)
+        log(`Building Windows ${format}`)
         // we use app name here - see https://github.com/electron-userland/electron-builder/pull/204
         const outFile = path.join(outDir, this.generateName(format, arch, false, "win"))
         promises.push(this.archiveApp(format, appOutDir, outFile)

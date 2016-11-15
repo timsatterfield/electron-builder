@@ -2,21 +2,22 @@ import { WinPackager } from "../winPackager"
 import { Arch } from "../metadata"
 import { exec, debug, doSpawn, handleProcess, use, asArray } from "../util/util"
 import * as path from "path"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { getBinFromBintray } from "../util/binDownload"
 import { v5 as uuid5 } from "uuid-1345"
-import { normalizeExt, TargetEx, getPublishConfigs, getResolvedPublishConfig } from "../platformPackager"
+import { normalizeExt, TargetEx, getPublishConfigs, getResolvedPublishConfig, ArtifactCreated } from "../platformPackager"
 import { archiveApp } from "./archive"
-import { subTask, task, log } from "../util/log"
-import { unlink, readFile } from "fs-extra-p"
+import { subTask, log } from "../util/log"
+import { unlink, readFile, writeFile, createReadStream } from "fs-extra-p"
 import { SemVer } from "semver"
 import { NsisOptions } from "../options/winOptions"
-import { writeJson } from "fs-extra-p"
-import { PublishConfiguration } from "../options/publishOptions"
+import { PublishConfiguration, GenericServerOptions, UpdateInfo } from "../options/publishOptions"
+import { safeDump } from "js-yaml"
+import { createHash } from "crypto"
 
-const NSIS_VERSION = "3.0.1"
+const NSIS_VERSION = "3.0.2"
 //noinspection SpellCheckingInspection
-const NSIS_SHA2 = "23280f66c07c923da6f29a3c318377720c8ecd7af4de3755256d1ecf60d07f74"
+const NSIS_SHA2 = "012c29d62e167ff74e858eeb929641dc2c9d7bfe7465e748648814660c61b419"
 
 //noinspection SpellCheckingInspection
 const ELECTRON_BUILDER_NS_UUID = "50e065bc-3134-11e6-9bab-38c9862bdaf3"
@@ -30,16 +31,16 @@ export default class NsisTarget extends TargetEx {
 
   private readonly nsisTemplatesDir = path.join(__dirname, "..", "..", "templates", "nsis")
 
-  private readonly publishConfig = this.computePublishConfig()
+  private readonly publishConfigs = this.computePublishConfigs()
 
   constructor(private packager: WinPackager, private outDir: string) {
     super("nsis")
   }
 
-  private computePublishConfig(): Promise<PublishConfiguration | null> {
+  private computePublishConfigs(): Promise<Array<PublishConfiguration> | null> {
     const publishConfigs = getPublishConfigs(this.packager, this.options)
     if (publishConfigs != null && publishConfigs.length > 0) {
-      return getResolvedPublishConfig(this.packager.info, publishConfigs[0], true)
+      return BluebirdPromise.map(publishConfigs, it => getResolvedPublishConfig(this.packager.info, it, true))
     }
     else {
       return BluebirdPromise.resolve(null)
@@ -52,9 +53,11 @@ export default class NsisTarget extends TargetEx {
   }
 
   private async doBuild(appOutDir: string, arch: Arch) {
-    const publishConfig = await this.publishConfig
-    if (publishConfig != null) {
-      await writeJson(path.join(appOutDir, "resources", ".app-update.json"), publishConfig)
+    log(`Packaging NSIS installer for arch ${Arch[arch]}`)
+
+    const publishConfigs = await this.publishConfigs
+    if (publishConfigs != null) {
+      await writeFile(path.join(appOutDir, "resources", "app-update.yml"), safeDump(publishConfigs[0]))
     }
 
     const packager = this.packager
@@ -62,19 +65,24 @@ export default class NsisTarget extends TargetEx {
     return await archiveApp(packager.devMetadata.build.compression, "7z", archiveFile, appOutDir, false, true)
   }
 
-  finishBuild(): Promise<any> {
-    return task("Building NSIS installer", this.buildInstaller()
-      .then(() => BluebirdPromise.map(this.archs.values(), it => unlink(it))))
+  async finishBuild(): Promise<any> {
+    log("Building NSIS installer")
+    try {
+      await this.buildInstaller()
+    }
+    finally {
+      await BluebirdPromise.map(this.archs.values(), it => unlink(it))
+    }
   }
 
   private async buildInstaller(): Promise<any> {
     const packager = this.packager
-
-    const iconPath = await packager.getIconPath()
     const appInfo = packager.appInfo
     const version = appInfo.version
+    const installerFilename = `${appInfo.productFilename} Setup ${version}.exe`
+    const iconPath = await packager.getIconPath()
 
-    const installerPath = path.join(this.outDir, `${appInfo.productFilename} Setup ${version}.exe`)
+    const installerPath = path.join(this.outDir, installerFilename)
     const guid = this.options.guid || await BluebirdPromise.promisify(uuid5)({namespace: ELECTRON_BUILDER_NS_UUID, name: appInfo.id})
     const defines: any = {
       APP_ID: appInfo.id,
@@ -148,6 +156,7 @@ export default class NsisTarget extends TargetEx {
       OutFile: `"${installerPath}"`,
       VIProductVersion: `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}.${appInfo.buildNumber || "0"}`,
       VIAddVersionKey: versionKey,
+      Unicode: true,
     }
 
     if (packager.devMetadata.build.compression === "store") {
@@ -201,7 +210,41 @@ export default class NsisTarget extends TargetEx {
     await subTask(`Executing makensis — installer`, this.executeMakensis(defines, commands, true, script))
     await packager.sign(installerPath)
 
-    this.packager.dispatchArtifactCreated(installerPath, `${appInfo.name}-Setup-${version}.exe`)
+    const publishConfigs = await this.publishConfigs
+    const githubArtifactName = `${appInfo.name}-Setup-${version}.exe`
+    if (publishConfigs != null) {
+      let sha2: string | null = null
+      for (let publishConfig of publishConfigs) {
+        if (publishConfig.provider === "generic" || publishConfig.provider === "github") {
+          if (sha2 == null) {
+            sha2 = await sha256(installerPath)
+          }
+
+          const channel = (<GenericServerOptions>publishConfig).channel || "latest"
+          if (publishConfig.provider === "generic") {
+            await writeFile(path.join(this.outDir, `${channel}.yml`), safeDump(<UpdateInfo>{
+              version: version,
+              path: installerFilename,
+              sha2: sha2,
+            }))
+          }
+          else {
+            packager.info.eventEmitter.emit("artifactCreated", <ArtifactCreated>{
+              data: new Buffer(safeDump(<UpdateInfo>{
+                version: version,
+                path: githubArtifactName,
+                sha2: sha2,
+              })),
+              artifactName: `${channel}.yml`,
+              packager: packager,
+              publishConfig: publishConfig,
+            })
+          }
+        }
+      }
+    }
+
+    packager.dispatchArtifactCreated(installerPath, githubArtifactName)
   }
 
   private async executeMakensis(defines: any, commands: any, isInstaller: boolean, originalScript: string) {
@@ -291,4 +334,21 @@ export default class NsisTarget extends TargetEx {
       childProcess.stdin.end(script)
     })
   }
+}
+
+function sha256(file: string) {
+  return new BluebirdPromise<string>((resolve, reject) => {
+    const hash = createHash("sha256")
+    hash
+      .on("error", reject)
+      .setEncoding("hex")
+
+    createReadStream(file)
+      .on("error", reject)
+      .on("end", () => {
+        hash.end()
+        resolve(<string>hash.read())
+      })
+      .pipe(hash, {end: false})
+  })
 }

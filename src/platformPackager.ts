@@ -1,23 +1,24 @@
 import { AppMetadata, DevMetadata, Platform, PlatformSpecificBuildOptions, Arch, FileAssociation } from "./metadata"
 import EventEmitter = NodeJS.EventEmitter
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import * as path from "path"
 import { readdir, remove } from "fs-extra-p"
-import { statOrNull, use, unlinkIfExists, isEmptyOrSpaces, asArray } from "./util/util"
+import { statOrNull, use, unlinkIfExists, isEmptyOrSpaces, asArray, debug } from "./util/util"
 import { Packager } from "./packager"
 import { AsarOptions } from "asar-electron-builder"
 import { archiveApp } from "./targets/archive"
 import { Minimatch } from "minimatch"
 import { checkFileInArchive, createAsarArchive } from "./asarUtil"
-import { warn, log, task } from "./util/log"
+import { warn, log } from "./util/log"
 import { AppInfo } from "./appInfo"
-import { copyFiltered, devDependencies } from "./util/filter"
+import { copyFiltered } from "./util/filter"
 import { pack } from "./packager/dirPackager"
 import { TmpDir } from "./util/tmp"
 import { FileMatchOptions, FileMatcher, FilePattern, deprecatedUserIgnoreFilter } from "./fileMatcher"
 import { BuildOptions } from "./builder"
-import { PublishConfiguration, GithubOptions, BintrayOptions } from "./options/publishOptions"
+import { PublishConfiguration, GithubOptions, BintrayOptions, GenericServerOptions } from "./options/publishOptions"
 import { getRepositoryInfo } from "./repositoryInfo"
+import { dependencies } from "./yarn"
 
 export interface PackagerOptions {
   targets?: Map<Platform, Map<Arch, string[]>>
@@ -75,7 +76,7 @@ export interface BuildInfo {
 }
 
 export class Target {
-  constructor(public name: string) {
+  constructor(public readonly name: string) {
   }
 
   finishBuild(): Promise<any> {
@@ -84,6 +85,10 @@ export class Target {
 }
 
 export abstract class TargetEx extends Target {
+  constructor(name: string, public readonly isAsyncSupported: boolean = true) {
+    super(name)
+  }
+
   abstract build(appOutDir: string, arch: Arch): Promise<any>
 }
 
@@ -103,7 +108,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   readonly appInfo: AppInfo
 
-  constructor(public info: BuildInfo) {
+  constructor(public readonly info: BuildInfo) {
     this.devMetadata = info.devMetadata
     this.platformSpecificBuildOptions = this.normalizePlatformSpecificBuildOptions((<any>info.devMetadata.build)[this.platform.buildConfigurationKey])
     this.appInfo = this.prepareAppInfo(info.appInfo)
@@ -132,7 +137,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   abstract createTargets(targets: Array<string>, mapper: (name: string, factory: (outDir: string) => Target) => void, cleanupTasks: Array<() => Promise<any>>): void
 
   protected getCscPassword(): string {
-    const password = this.options.cscKeyPassword || process.env.CSC_KEY_PASSWORD
+    const password = this.doGetCscPassword()
     if (isEmptyOrSpaces(password)) {
       log("CSC_KEY_PASSWORD is not defined, empty password will be used")
       return ""
@@ -140,6 +145,10 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     else {
       return password.trim()
     }
+  }
+
+  protected doGetCscPassword() {
+    return this.options.cscKeyPassword || process.env.CSC_KEY_PASSWORD
   }
 
   get relativeBuildResourcesDirname() {
@@ -154,14 +163,13 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     this.info.eventEmitter.emit("artifactCreated", {
       file: file,
       artifactName: artifactName,
-      platform: this.platform,
       packager: this,
     })
   }
 
   abstract pack(outDir: string, arch: Arch, targets: Array<Target>, postAsyncTasks: Array<Promise<any>>): Promise<any>
 
-  private getExtraFileMatchers(isResources: boolean, appOutDir: string, fileMatchOptions: FileMatchOptions, customBuildOptions: DC): Array<FileMatcher> | n {
+  private getExtraFileMatchers(isResources: boolean, appOutDir: string, fileMatchOptions: FileMatchOptions, customBuildOptions: DC): Array<FileMatcher> | null {
     const base = isResources ? this.getResourcesDir(appOutDir) : (this.platform === Platform.MAC ? path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents") : appOutDir)
     return this.getFileMatchers(isResources ? "extraResources" : "extraFiles", this.projectDir, base, true, fileMatchOptions, customBuildOptions)
   }
@@ -178,37 +186,45 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
     const resourcesPath = this.platform === Platform.MAC ? path.join(appOutDir, "Electron.app", "Contents", "Resources") : path.join(appOutDir, "resources")
 
-    const p = pack(this, appOutDir, platformName, Arch[arch], this.info.electronVersion, async() => {
-      const ignoreFiles = new Set([path.resolve(this.info.appDir, outDir), path.resolve(this.info.appDir, this.buildResourcesDir)])
+    log(`Packaging for ${platformName} ${Arch[arch]} using electron ${this.info.electronVersion} to ${path.relative(this.projectDir, appOutDir)}`)
+    await pack(this, appOutDir, platformName, Arch[arch], this.info.electronVersion, async () => {
+      const appDir = this.info.appDir
+      const ignoreFiles = new Set([path.resolve(appDir, outDir), path.resolve(appDir, this.buildResourcesDir)])
       // prune dev or not listed dependencies
-      const result = await devDependencies(this.info.appDir)
-      for (let it of result) {
-        ignoreFiles.add(it)
+      await dependencies(appDir, true, ignoreFiles)
+
+      if (debug.enabled) {
+        const nodeModulesDir = path.join(appDir, "node_modules")
+        debug(`Pruned dev or extraneous dependencies: ${Array.from(ignoreFiles).slice(2).map(it => path.relative(nodeModulesDir, it)).join(", ")}`)
       }
 
-      const patterns = this.getFileMatchers("files", this.info.appDir, path.join(resourcesPath, "app"), false, fileMatchOptions, platformSpecificBuildOptions)
-      let defaultMatcher = patterns != null ? patterns[0] : new FileMatcher(this.info.appDir, path.join(resourcesPath, "app"), fileMatchOptions)
-
+      const patterns = this.getFileMatchers("files", appDir, path.join(resourcesPath, "app"), false, fileMatchOptions, platformSpecificBuildOptions)
+      let defaultMatcher = patterns == null ? new FileMatcher(appDir, path.join(resourcesPath, "app"), fileMatchOptions) : patterns[0]
       if (defaultMatcher.isEmpty()) {
         defaultMatcher.addPattern("**/*")
       }
-      defaultMatcher.addPattern("!**/node_modules/*/{README.md,README,readme.md,readme,test}")
+      else {
+        defaultMatcher.addPattern("package.json")
+      }
+      defaultMatcher.addPattern("!**/node_modules/*/{CHANGELOG.md,ChangeLog,changelog.md,README.md,README,readme.md,readme,test,__tests__,tests,powered-test,example,examples,*.d.ts}")
       defaultMatcher.addPattern("!**/node_modules/.bin")
       defaultMatcher.addPattern("!**/*.{o,hprof,orig,pyc,pyo,rbc,swp}")
       defaultMatcher.addPattern("!**/._*")
+      defaultMatcher.addPattern("!.idea")
+      defaultMatcher.addPattern("!*.iml")
       //noinspection SpellCheckingInspection
-      defaultMatcher.addPattern("!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,__pycache__,thumbs.db,.gitignore,.gitattributes,.editorconfig,.idea,appveyor.yml,.travis.yml,circle.yml,npm-debug.log}")
+      defaultMatcher.addPattern("!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,__pycache__,thumbs.db,.gitignore,.gitattributes,.editorconfig,.flowconfig,.yarn-metadata.json,.idea,appveyor.yml,.travis.yml,circle.yml,npm-debug.log,.nyc_output,yarn.lock,.yarn-integrity}")
 
       let rawFilter: any = null
       const deprecatedIgnore = (<any>this.devMetadata.build).ignore
       if (deprecatedIgnore != null) {
         if (typeof deprecatedIgnore === "function") {
-          log(`"ignore is specified as function, may be new "files" option will be suit your needs? Please see https://github.com/electron-userland/electron-builder/wiki/Options#BuildMetadata-files`)
+          warn(`"ignore" is specified as function, may be new "files" option will be suit your needs? Please see https://github.com/electron-userland/electron-builder/wiki/Options#BuildMetadata-files`)
         }
         else {
-          warn(`"ignore is deprecated, please use "files", see https://github.com/electron-userland/electron-builder/wiki/Options#BuildMetadata-files`)
+          warn(`"ignore" is deprecated, please use "files", see https://github.com/electron-userland/electron-builder/wiki/Options#BuildMetadata-files`)
         }
-        rawFilter = deprecatedUserIgnoreFilter(deprecatedIgnore, this.info.appDir)
+        rawFilter = deprecatedUserIgnoreFilter(deprecatedIgnore, appDir)
       }
 
       let excludePatterns: Array<Minimatch> = []
@@ -226,9 +242,16 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       }
 
       const filter = defaultMatcher.createFilter(ignoreFiles, rawFilter, excludePatterns.length ? excludePatterns : null)
-      const promise = asarOptions == null ?
-        copyFiltered(this.info.appDir, path.join(resourcesPath, "app"), filter, this.info.devMetadata.build.dereference || this.platform === Platform.WINDOWS)
-        : createAsarArchive(this.info.appDir, resourcesPath, asarOptions, filter)
+      let promise
+      if (asarOptions == null) {
+        promise = copyFiltered(appDir, path.join(resourcesPath, "app"), filter, this.info.devMetadata.build.dereference || this.platform === Platform.WINDOWS)
+      }
+      else {
+        const unpackPattern = this.getFileMatchers("asarUnpack", appDir, path.join(resourcesPath, "app"), false, fileMatchOptions, platformSpecificBuildOptions)
+        const fileMatcher = unpackPattern == null ? null : unpackPattern[0]
+        //noinspection ES6MissingAwait
+        promise = createAsarArchive(appDir, resourcesPath, asarOptions, filter, fileMatcher == null ? null : fileMatcher.createFilter())
+      }
 
       const promises = [promise, unlinkIfExists(path.join(resourcesPath, "default_app.asar")), unlinkIfExists(path.join(appOutDir, "version"))]
       if (this.info.electronVersion != null && this.info.electronVersion[0] === "0") {
@@ -239,7 +262,6 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       promises.push(this.postInitApp(appOutDir))
       await BluebirdPromise.all(promises)
     })
-    await task(`Packaging for platform ${platformName} ${Arch[arch]} using electron ${this.info.electronVersion} to ${path.relative(this.projectDir, appOutDir)}`, p)
 
     await this.doCopyExtraFiles(extraResourceMatchers)
     await this.doCopyExtraFiles(extraFileMatchers)
@@ -295,7 +317,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     })
   }
 
-  private doCopyExtraFiles(patterns: Array<FileMatcher> | n): Promise<any> {
+  private doCopyExtraFiles(patterns: Array<FileMatcher> | null): Promise<any> {
     if (patterns == null || patterns.length === 0) {
       return BluebirdPromise.resolve()
     }
@@ -311,20 +333,23 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  private getFileMatchers(name: "files" | "extraFiles" | "extraResources", defaultSrc: string, defaultDest: string, allowAdvancedMatching: boolean, fileMatchOptions: FileMatchOptions, customBuildOptions: DC): Array<FileMatcher> | n {
-    let globalPatterns: Array<string | FilePattern> | string | n = (<any>this.devMetadata.build)[name]
+  private getFileMatchers(name: "files" | "extraFiles" | "extraResources" | "asarUnpack", defaultSrc: string, defaultDest: string, allowAdvancedMatching: boolean, fileMatchOptions: FileMatchOptions, customBuildOptions: DC): Array<FileMatcher> | null {
+    let globalPatterns: Array<string | FilePattern> | string | n | FilePattern = (<any>this.devMetadata.build)[name]
     let platformSpecificPatterns: Array<string | FilePattern> | string | n = (<any>customBuildOptions)[name]
 
     const defaultMatcher = new FileMatcher(defaultSrc, defaultDest, fileMatchOptions)
     const fileMatchers: Array<FileMatcher> = []
 
-    function addPatterns(patterns: Array<string | FilePattern> | string | n) {
+    function addPatterns(patterns: Array<string | FilePattern> | string | n | FilePattern) {
       if (patterns == null) {
         return
       }
       else if (!Array.isArray(patterns)) {
-        defaultMatcher.addPattern(patterns)
-        return
+        if (typeof patterns === "string") {
+          defaultMatcher.addPattern(patterns)
+          return
+        }
+        patterns = [patterns]
       }
 
       for (let i = 0; i < patterns.length; i++) {
@@ -351,7 +376,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       fileMatchers.unshift(defaultMatcher)
     }
 
-    return fileMatchers.length ? fileMatchers : null
+    return fileMatchers.length === 0 ? null : fileMatchers
   }
 
   private getResourcesDir(appOutDir: string): string {
@@ -411,7 +436,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     await this.checkFileInPackage(resourcesDir, "package.json", "Application", isAsar)
   }
 
-  protected async archiveApp(format: string, appOutDir: string, outFile: string): Promise<any> {
+  protected archiveApp(format: string, appOutDir: string, outFile: string): Promise<any> {
     const isMac = this.platform === Platform.MAC
     return archiveApp(this.devMetadata.build.compression, format, outFile, isMac ? path.join(appOutDir, `${this.appInfo.productFilename}.app`) : appOutDir, isMac)
   }
@@ -441,7 +466,8 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   generateName2(ext: string | null, classifier: string | n, deployment: boolean): string {
     const dotExt = ext == null ? "" : `.${ext}`
-    return `${deployment ? this.appInfo.name : this.appInfo.productFilename}-${this.appInfo.version}${classifier == null ? "" : `-${classifier}`}${dotExt}`
+    const separator = ext === "deb" ? "_" : "-"
+    return `${deployment ? this.appInfo.name : this.appInfo.productFilename}${separator}${this.appInfo.version}${classifier == null ? "" : `${separator}${classifier}`}${dotExt}`
   }
 
   async getDefaultIcon(ext: string) {
@@ -487,10 +513,12 @@ export function getArchSuffix(arch: Arch): string {
 export interface ArtifactCreated {
   readonly packager: PlatformPackager<any>
 
-  readonly file: string
+  readonly file?: string
+  readonly data?: Buffer
+
   readonly artifactName?: string
 
-  readonly platform: Platform
+  readonly publishConfig?: PublishConfiguration
 }
 
 // fpm bug - rpm build --description is not escaped, well... decided to replace quite to smart quote
@@ -547,7 +575,14 @@ export function getPublishConfigs(packager: PlatformPackager<any>, platformSpeci
     .map(it => typeof it === "string" ? {provider: <any>it} : it)
 }
 
-export async function getResolvedPublishConfig(packager: BuildInfo, publishConfig: PublishConfiguration | GithubOptions | BintrayOptions, errorIfCannot: boolean): Promise<PublishConfiguration | null> {
+export async function getResolvedPublishConfig(packager: BuildInfo, publishConfig: PublishConfiguration | GithubOptions | BintrayOptions | GenericServerOptions, errorIfCannot: boolean): Promise<PublishConfiguration | null> {
+  if (publishConfig.provider === "generic") {
+    if ((<GenericServerOptions>publishConfig).url == null) {
+      throw new Error(`Please specify "url" for "generic" update server`)
+    }
+    return publishConfig
+  }
+
   async function getInfo() {
     const info = await getRepositoryInfo(packager.metadata, packager.devMetadata)
     if (info != null) {
@@ -578,11 +613,24 @@ export async function getResolvedPublishConfig(packager: BuildInfo, publishConfi
     }
   }
 
+  const copy: PublishConfiguration = Object.assign({}, publishConfig)
+  if (copy.owner == null) {
+    copy.owner = owner
+  }
+
   if (publishConfig.provider === "github") {
-    return Object.assign({}, publishConfig, {owner: owner, repo: project})
+    const options = <GithubOptions>copy
+    if (options.repo == null) {
+      options.repo = project
+    }
+    return options
   }
   else if (publishConfig.provider === "bintray") {
-    return Object.assign({}, publishConfig, {owner: owner, package: project, repo: "generic"})
+    const options = <BintrayOptions>copy
+    if (options.package == null) {
+      options.package = project
+    }
+    return options
   }
   else {
     return null

@@ -12,11 +12,11 @@ import { getArchSuffix, Target } from "out/platformPackager"
 import pathSorter from "path-sort"
 import DecompressZip from "decompress-zip"
 import { convertVersion } from "out/targets/squirrelPack"
-import { spawnNpmProduction } from "out/util/util"
 import { TEST_DIR } from "./config"
 import { deepAssign } from "out/util/deepAssign"
 import { AssertContext } from "ava-tf"
 import { SquirrelWindowsOptions } from "out/options/winOptions"
+import { spawn } from "out/util/util"
 
 if (process.env.TRAVIS !== "true") {
   process.env.CIRCLE_BUILD_NUM = 42
@@ -70,7 +70,7 @@ export async function assertPack(fixtureName: string, packagerOptions: PackagerO
   const customTmpDir = process.env.TEST_APP_TMP_DIR
   let dirToDelete: string | null = null
   if (useTempDir) {
-    // non-osx test uses the same dir as osx test, but we cannot share node_modules (because tests executed in parallel)
+    // non-macOS test uses the same dir as macOS test, but we cannot share node_modules (because tests executed in parallel)
     const dir = customTmpDir == null ? path.join(testDir, `${(tmpDirCounter++).toString(16)}`) : path.resolve(customTmpDir)
     if (customTmpDir == null) {
       dirToDelete = dir
@@ -92,7 +92,9 @@ export async function assertPack(fixtureName: string, packagerOptions: PackagerO
     if (projectDirCreated != null) {
       await projectDirCreated(projectDir)
       if (checkOptions.npmInstallBefore) {
-        await spawnNpmProduction("install", projectDir, false)
+        await spawn(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--production", "--cache-min", "999999999", "--no-bin-links"], {
+          cwd: projectDir
+        })
       }
     }
 
@@ -146,10 +148,10 @@ async function packAndCheck(outDir: string, packagerOptions: PackagerOptions, ch
   const artifacts: Map<Platform, Array<ArtifactCreated>> = new Map()
   packager.artifactCreated(event => {
     assertThat(event.file).isAbsolute()
-    let list = artifacts.get(event.platform)
+    let list = artifacts.get(event.packager.platform)
     if (list == null) {
       list = []
-      artifacts.set(event.platform, list)
+      artifacts.set(event.packager.platform, list)
     }
     list.push(event)
   })
@@ -190,7 +192,7 @@ async function checkLinuxResult(outDir: string, packager: Packager, checkOptions
         result.push(`${appInfo.name}-${appInfo.version}-${arch === Arch.x64 ? "x86_64" : Arch[arch]}.AppImage`)
       }
       else if (target === "deb") {
-        result.push(`${appInfo.name}-${appInfo.version}-${arch === Arch.x64 ? "amd64" : Arch[arch]}.deb`)
+        result.push(`${appInfo.name}_${appInfo.version}_${arch === Arch.x64 ? "amd64" : Arch[arch]}.deb`)
       }
       else {
         result.push(`TestApp-${appInfo.version}.${target}`)
@@ -208,7 +210,7 @@ async function checkLinuxResult(outDir: string, packager: Packager, checkOptions
   const productFilename = appInfo.productFilename
   const expectedContents = pathSorter(expectedLinuxContents.map(it => {
     if (it === "/opt/TestApp/TestApp") {
-      return `/opt/${productFilename}/${productFilename}`
+      return `/opt/${productFilename}/TestApp`
     }
     else if (it === "/usr/share/applications/TestApp.desktop") {
       return `/usr/share/applications/${productFilename}.desktop`
@@ -218,10 +220,10 @@ async function checkLinuxResult(outDir: string, packager: Packager, checkOptions
     }
   }))
 
-  const packageFile = `${outDir}/TestApp-${appInfo.version}-${arch === Arch.ia32 ? "ia32" : (arch === Arch.x64 ? "amd64" : "armv7l")}.deb`
+  const packageFile = `${outDir}/TestApp_${appInfo.version}_${arch === Arch.ia32 ? "ia32" : (arch === Arch.x64 ? "amd64" : "armv7l")}.deb`
   assertThat(await getContents(packageFile)).isEqualTo(expectedContents)
   if (arch === Arch.ia32) {
-    assertThat(await getContents(`${outDir}/TestApp-${appInfo.version}-i386.deb`)).isEqualTo(expectedContents)
+    assertThat(await getContents(`${outDir}/TestApp_${appInfo.version}_i386.deb`)).isEqualTo(expectedContents)
   }
 
   assertThat(parseDebControl(await exec("dpkg", ["--info", packageFile]))).hasProperties({

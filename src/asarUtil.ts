@@ -4,7 +4,7 @@ import {
   lstat, readdir, readFile, Stats, createWriteStream, ensureDir, createReadStream, readJson,
   writeFile, realpath
 } from "fs-extra-p"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import * as path from "path"
 import { log } from "./util/log"
 import { Minimatch } from "minimatch"
@@ -16,66 +16,74 @@ const pickle = require ("chromium-pickle-js")
 const Filesystem = require("asar-electron-builder/lib/filesystem")
 const UINT64 = require("cuint").UINT64
 
-const MAX_FILE_REQUESTS = 32
+const MAX_FILE_REQUESTS = 8
 const concurrency = {concurrency: MAX_FILE_REQUESTS}
 const NODE_MODULES_PATTERN = path.sep + "node_modules" + path.sep
 
-export async function walk(dirPath: string, consumer?: (file: string, stat: Stats) => void, filter?: Filter, addRootToResult?: boolean): Promise<Array<string>> {
-  const list = await BluebirdPromise.map(await readdir(dirPath), name => {
-    const filePath = dirPath + path.sep + name
-    return lstat(filePath)
-      .then((stat): any => {
-        if (filter != null && !filter(filePath, stat)) {
-          return null
-        }
-
-        if (consumer != null) {
-          consumer(filePath, stat)
-        }
-        if (stat.isDirectory()) {
-          return walk(filePath, consumer, filter, true)
-        }
-        return filePath
-      })
-  }, concurrency)
-
-  list.sort((a, b) => {
-    // files before directories
-    if (Array.isArray(a) && Array.isArray(b)) {
-      return 0
-    }
-    else if (a == null || Array.isArray(a)) {
-      return 1
-    }
-    else if (b == null || Array.isArray(b)) {
-      return -1
+export async function walk(initialDirPath: string, consumer?: (file: string, stat: Stats) => void, filter?: Filter): Promise<Array<string>> {
+  const result: Array<string> = []
+  const queue: Array<string> = [initialDirPath]
+  let addDirToResult = false
+  while (queue.length > 0) {
+    const dirPath = queue.pop()!
+    if (addDirToResult) {
+      result.push(dirPath)
     }
     else {
-      return a.localeCompare(b)
+      addDirToResult = true
     }
-  })
 
-  const result: Array<string> = addRootToResult ? [dirPath] : []
-  for (let item of list) {
-    if (item != null) {
-      if (Array.isArray(item)) {
-        result.push.apply(result, item)
-      }
-      else {
-        result.push(item)
-      }
+    const childNames = await readdir(dirPath)
+    childNames.sort()
+
+    const dirs: Array<string> = []
+    await BluebirdPromise.map(childNames, name => {
+      const filePath = dirPath + path.sep + name
+      return lstat(filePath)
+        .then(stat => {
+          if (filter != null && !filter(filePath, stat)) {
+            return
+          }
+
+          if (consumer != null) {
+            consumer(filePath, stat)
+          }
+
+          if (stat.isDirectory()) {
+            dirs.push(filePath)
+          }
+          else {
+            result.push(filePath)
+          }
+        })
+    }, concurrency)
+
+    for (let i = dirs.length - 1; i > -1; i--) {
+      queue.push(dirs[i])
     }
   }
+
   return result
 }
 
-export async function createAsarArchive(src: string, resourcesPath: string, options: AsarOptions, filter: Filter): Promise<any> {
+export async function createAsarArchive(src: string, resourcesPath: string, options: AsarOptions, filter: Filter, unpackPattern: Filter | null): Promise<any> {
   // sort files to minimize file change (i.e. asar file is not changed dramatically on small change)
-  await new AsarPackager(src, resourcesPath, options).pack(filter)
+  await new AsarPackager(src, resourcesPath, options, unpackPattern).pack(filter)
 }
 
 function isUnpackDir(path: string, pattern: Minimatch, rawPattern: string): boolean {
   return path.startsWith(rawPattern) || pattern.match(path)
+}
+
+function addValue(map: Map<string, Array<string>>, key: string, value: string) {
+  let list = map.get(key)
+  if (list == null) {
+    list = [value]
+    map.set(key, list)
+  }
+  else {
+    list.push(value)
+  }
 }
 
 class AsarPackager {
@@ -86,7 +94,7 @@ class AsarPackager {
 
   private srcRealPath: Promise<string>
 
-  constructor(private src: string, private resourcesPath: string, private options: AsarOptions) {
+  constructor(private readonly src: string, private readonly resourcesPath: string, private readonly options: AsarOptions, private readonly unpackPattern: Filter | null) {
     this.outFile = path.join(this.resourcesPath, "app.asar")
   }
 
@@ -107,9 +115,10 @@ class AsarPackager {
     return this.srcRealPath
   }
 
-  async detectUnpackedDirs(files: Array<string>, metadata: Map<string, Stats>, autoUnpackDirs: Set<string>, createDirPromises: Array<Promise<any>>, unpackedDest: string, fileIndexToModulePackageData: Array<BluebirdPromise<string>>) {
+  async detectUnpackedDirs(files: Array<string>, metadata: Map<string, Stats>, autoUnpackDirs: Set<string>, unpackedDest: string, fileIndexToModulePackageData: Map<number, BluebirdPromise<string>>) {
     const packageJsonStringLength = "package.json".length
-    const readPackageJsonPromises: Array<Promise<any>> = []
+    const dirToCreate = new Map<string, Array<string>>()
+
     for (let i = 0, n = files.length; i < n; i++) {
       const file = files[i]
       const index = file.lastIndexOf(NODE_MODULES_PATTERN)
@@ -129,25 +138,14 @@ class AsarPackager {
       const nodeModuleDir = file.substring(0, nextSlashIndex)
 
       if (file.length === (nodeModuleDir.length + 1 + packageJsonStringLength) && file.endsWith("package.json")) {
-        const promise = readJson(file)
-
-        if (readPackageJsonPromises.length > MAX_FILE_REQUESTS) {
-          await BluebirdPromise.all(readPackageJsonPromises)
-          readPackageJsonPromises.length = 0
-        }
-        readPackageJsonPromises.push(promise)
-        fileIndexToModulePackageData[i] = promise
+        fileIndexToModulePackageData.set(i, readJson(file).then(it => cleanupPackageJson(it)))
       }
 
       if (autoUnpackDirs.has(nodeModuleDir)) {
         const fileParent = path.dirname(file)
         if (fileParent !== nodeModuleDir && !autoUnpackDirs.has(fileParent)) {
           autoUnpackDirs.add(fileParent)
-          createDirPromises.push(ensureDir(path.join(unpackedDest, path.relative(this.src, fileParent))))
-          if (createDirPromises.length > MAX_FILE_REQUESTS) {
-            await BluebirdPromise.all(createDirPromises)
-            createDirPromises.length = 0
-          }
+          addValue(dirToCreate, path.relative(this.src, nodeModuleDir), path.relative(nodeModuleDir, fileParent))
         }
         continue
       }
@@ -165,16 +163,12 @@ class AsarPackager {
         continue
       }
 
-      log(`${path.relative(this.src, nodeModuleDir)} is not packed into asar archive - contains executable code`)
+      debug(`${path.relative(this.src, nodeModuleDir)} is not packed into asar archive - contains executable code`)
 
       let fileParent = path.dirname(file)
 
       // create parent dir to be able to copy file later without directory existence check
-      createDirPromises.push(ensureDir(path.join(unpackedDest, path.relative(this.src, fileParent))))
-      if (createDirPromises.length > MAX_FILE_REQUESTS) {
-        await BluebirdPromise.all(createDirPromises)
-        createDirPromises.length = 0
-      }
+      addValue(dirToCreate, path.relative(this.src, nodeModuleDir), path.relative(nodeModuleDir, fileParent))
 
       while (fileParent !== nodeModuleDir) {
         autoUnpackDirs.add(fileParent)
@@ -183,25 +177,27 @@ class AsarPackager {
       autoUnpackDirs.add(nodeModuleDir)
     }
 
-    if (readPackageJsonPromises.length > 0) {
-      await BluebirdPromise.all(readPackageJsonPromises)
+    if (fileIndexToModulePackageData.size > 0) {
+      await BluebirdPromise.all(<any>fileIndexToModulePackageData.values())
     }
-    if (createDirPromises.length > 0) {
-      await BluebirdPromise.all(createDirPromises)
-      createDirPromises.length = 0
+
+    if (dirToCreate.size > 0) {
+      // child directories should be not created asynchronously - parent directories should be created first
+      await BluebirdPromise.map(dirToCreate.keys(), async (it) => {
+        const base = path.join(unpackedDest, it)
+        await ensureDir(base)
+        await BluebirdPromise.each(dirToCreate.get(it)!, it => ensureDir(path.join(base, it)))
+      }, concurrency)
     }
   }
 
   async createPackageFromFiles(files: Array<string>, metadata: Map<string, Stats>) {
     // search auto unpacked dir
     const autoUnpackDirs = new Set<string>()
-
-    const createDirPromises: Array<Promise<any>> = [ensureDir(path.dirname(this.outFile))]
     const unpackedDest = `${this.outFile}.unpacked`
-
-    const fileIndexToModulePackageData: Array<BluebirdPromise<string>> = new Array(files.length)
+    const fileIndexToModulePackageData = new Map<number, BluebirdPromise<string>>()
     if (this.options.smartUnpack !== false) {
-      await this.detectUnpackedDirs(files, metadata, autoUnpackDirs, createDirPromises, unpackedDest, fileIndexToModulePackageData)
+      await this.detectUnpackedDirs(files, metadata, autoUnpackDirs, unpackedDest, fileIndexToModulePackageData)
     }
 
     const unpackDir = this.options.unpackDir == null ? null : new Minimatch(this.options.unpackDir)
@@ -209,6 +205,7 @@ class AsarPackager {
       matchBase: true
     })
 
+    const createDirPromises: Array<Promise<any>> = [ensureDir(path.dirname(this.outFile))]
     const copyPromises: Array<Promise<any>> = []
     const mainPackageJson = path.join(this.src, "package.json")
     for (let i = 0, n = files.length; i < n; i++) {
@@ -223,7 +220,7 @@ class AsarPackager {
           createDirPromises.length = 0
         }
 
-        const packageDataPromise = fileIndexToModulePackageData[i]
+        const packageDataPromise = fileIndexToModulePackageData.get(i)
         let newData: any | null = null
         if (packageDataPromise == null) {
           if (this.options.extraMetadata != null && file === mainPackageJson) {
@@ -231,19 +228,25 @@ class AsarPackager {
           }
         }
         else {
-          newData = cleanupPackageJson(packageDataPromise.value())
+          newData = packageDataPromise.value()
         }
 
         const fileSize = newData == null ? stat.size : Buffer.byteLength(newData)
         const node = this.fs.searchNodeFromPath(file)
         node.size = fileSize
-        if (dirNode.unpacked || (unpack != null && unpack.match(file))) {
+        if (dirNode.unpacked || (this.unpackPattern != null && this.unpackPattern(file, stat)) || (unpack != null && unpack.match(file))) {
           node.unpacked = true
 
           if (!dirNode.unpacked) {
-            createDirPromises.push(ensureDir(path.join(unpackedDest, path.relative(this.src, fileParent))))
-            await BluebirdPromise.all(createDirPromises)
-            createDirPromises.length = 0
+            const promise = ensureDir(path.join(unpackedDest, path.relative(this.src, fileParent)))
+            if (createDirPromises.length === 0) {
+              await createDirPromises
+            }
+            else {
+              createDirPromises.push(promise)
+              await BluebirdPromise.all(createDirPromises)
+              createDirPromises.length = 0
+            }
           }
 
           const unpackedFile = path.join(unpackedDest, path.relative(this.src, file))
@@ -301,7 +304,9 @@ class AsarPackager {
       }
     }
 
-    await BluebirdPromise.all(copyPromises)
+    if (copyPromises.length > 0) {
+      await BluebirdPromise.all(copyPromises)
+    }
   }
 
   private async addLink(file: string) {

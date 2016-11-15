@@ -1,11 +1,8 @@
 import * as path from "path"
-import {
-  computeDefaultAppDirectory, installDependencies, getElectronVersion, use,
-  exec, isEmptyOrSpaces, statOrNull, getGypEnv
-} from "./util/util"
+import { computeDefaultAppDirectory, getElectronVersion, use, exec, isEmptyOrSpaces } from "./util/util"
 import { all, executeFinally } from "./util/promise"
 import { EventEmitter } from "events"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { AppMetadata, DevMetadata, Platform, Arch } from "./metadata"
 import { PlatformPackager, BuildInfo, ArtifactCreated, Target } from "./platformPackager"
 import { WinPackager } from "./winPackager"
@@ -20,6 +17,7 @@ import { createTargets } from "./targets/targetFactory"
 import { readPackageJson } from "./util/readPackageJson"
 import { TmpDir } from "./util/tmp"
 import { BuildOptions } from "./builder"
+import { getGypEnv, installOrRebuild } from "./yarn"
 
 function addHandler(emitter: EventEmitter, event: string, handler: Function) {
   emitter.on(event, handler)
@@ -99,7 +97,7 @@ export class Packager implements BuildInfo {
 
     this.appInfo = new AppInfo(this.metadata, this.devMetadata)
     const cleanupTasks: Array<() => Promise<any>> = []
-    return executeFinally(this.doBuild(cleanupTasks), () => all(cleanupTasks.map(it => it()).concat(this.tempDirManager.cleanup())))
+    return await executeFinally(this.doBuild(cleanupTasks), () => all(cleanupTasks.map(it => it()).concat(this.tempDirManager.cleanup())))
   }
 
   private async doBuild(cleanupTasks: Array<() => Promise<any>>): Promise<Map<Platform, Map<String, Target>>> {
@@ -128,7 +126,7 @@ export class Packager implements BuildInfo {
 
         if (checkWine && wineCheck != null) {
           checkWine = false
-          checkWineVersion(wineCheck)
+          await checkWineVersion(wineCheck)
         }
 
         await helper.pack(outDir, arch, createTargets(nameToTarget, targets, outDir, helper, cleanupTasks), distTasks)
@@ -200,6 +198,19 @@ export class Packager implements BuildInfo {
       throw new Error(util.format(errorMessages.buildIsMissed, devAppPackageFile))
     }
     else {
+      if (build["osx-sign"] != null) {
+        throw new Error("osx-sign is deprecated and not supported — please see https://github.com/electron-userland/electron-builder/wiki/Code-Signing")
+      }
+      if (build["osx"] != null) {
+        throw new Error(`build.osx is deprecated and not supported — please use build.mac instead`)
+      }
+      if (build["app-copyright"] != null) {
+        throw new Error(`build.app-copyright is deprecated and not supported — please use build.copyright instead`)
+      }
+      if (build["app-category-type"] != null) {
+        throw new Error(`build.app-category-type is deprecated and not supported — please use build.mac.category instead`)
+      }
+
       const author = appMetadata.author
       if (author == null) {
         throw new Error(`Please specify "author" in the application package.json ('${appPackageFile}') — it is used as company name.`)
@@ -209,8 +220,8 @@ export class Packager implements BuildInfo {
         throw new Error(util.format(errorMessages.nameInBuildSpecified, appPackageFile))
       }
 
-      if (build.osx != null) {
-        warn('"build.osx" is deprecated — please use "mac" instead of "osx"')
+      if (build.directories != null) {
+        throw new Error(`'directories' in the 'build' is not correct. Please move 'directories' from 'build' to root`)
       }
 
       if (build.prune != null) {
@@ -220,29 +231,24 @@ export class Packager implements BuildInfo {
   }
 
   private async installAppDependencies(platform: Platform, arch: Arch): Promise<any> {
-    if (this.devMetadata.build.nodeGypRebuild === true) {
-      log(`Execute node-gyp rebuild for arch ${Arch[arch]}`)
+    const options = this.devMetadata.build
+    if (options.nodeGypRebuild === true) {
+      log(`Executing node-gyp rebuild for arch ${Arch[arch]}`)
       await exec(process.platform === "win32" ? "node-gyp.cmd" : "node-gyp", ["rebuild"], {
         env: getGypEnv(this.electronVersion, Arch[arch]),
       })
     }
 
-    if (this.isTwoPackageJsonProjectLayoutUsed) {
-      if (this.devMetadata.build.npmRebuild === false) {
-        log("Skip app dependencies rebuild because npmRebuild is set to false")
-      }
-      else {
-        const forceBuildFromSource = this.devMetadata.build.npmSkipBuildFromSource !== true
-        if (platform.nodeName !== process.platform && forceBuildFromSource) {
-          log("Skip app dependencies rebuild because platform is different")
-        }
-        else {
-          await installDependencies(this.appDir, this.electronVersion, Arch[arch], forceBuildFromSource, (await statOrNull(path.join(this.appDir, "node_modules"))) == null ? "install" : "rebuild")
-        }
-      }
+    if (options.npmRebuild === false) {
+      log("Skip app dependencies rebuild because npmRebuild is set to false")
+      return
+    }
+
+    if (options.npmSkipBuildFromSource !== true && platform.nodeName !== process.platform) {
+      log("Skip app dependencies rebuild because platform is different")
     }
     else {
-      log("Skip app dependencies rebuild because dev and app dependencies are not separated")
+      await installOrRebuild(options, this.appDir, this.electronVersion, Arch[arch])
     }
   }
 }

@@ -1,16 +1,15 @@
-import { exec, getTempName, isEmptyOrSpaces } from "./util/util"
+import { exec, getTempName, isEmptyOrSpaces, isCi, getCacheDirectory } from "./util/util"
 import { deleteFile, outputFile, copy, rename } from "fs-extra-p"
 import { download } from "./util/httpRequest"
 import * as path from "path"
 import { executeFinally, all } from "./util/promise"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { randomBytes } from "crypto"
-import { homedir } from "os"
 import { TmpDir } from "./util/tmp"
 
-const appleCertificatePrefixes = ["Developer ID Application:", "3rd Party Mac Developer Application:", "Developer ID Installer:", "3rd Party Mac Developer Installer:"]
+export const appleCertificatePrefixes = ["Developer ID Application:", "Developer ID Installer:", "3rd Party Mac Developer Application:", "3rd Party Mac Developer Installer:"]
 
-export type CertType = "Developer ID Application" | "3rd Party Mac Developer Application" | "Developer ID Installer" | "3rd Party Mac Developer Installer"
+export type CertType = "Developer ID Application" | "Developer ID Installer" | "3rd Party Mac Developer Application" | "3rd Party Mac Developer Installer" | "Mac Developer"
 
 export interface CodeSigningInfo {
   keychainName?: string | null
@@ -39,8 +38,8 @@ let bundledCertKeychainAdded: Promise<any> | null = null
 // https://github.com/electron-userland/electron-builder/issues/398
 async function createCustomCertKeychain() {
   // copy to temp and then atomic rename to final path
-  const tmpKeychainPath = path.join(homedir(), ".cache", getTempName("electron_builder_root_certs"))
-  const keychainPath = path.join(homedir(), ".cache", "electron_builder_root_certs.keychain")
+  const tmpKeychainPath = path.join(getCacheDirectory(), getTempName("electron-builder-root-certs"))
+  const keychainPath = path.join(getCacheDirectory(), "electron-builder-root-certs.keychain")
   const results = await BluebirdPromise.all<string>([
     exec("security", ["list-keychains"]),
     copy(path.join(__dirname, "..", "certs", "root_certs.keychain"), tmpKeychainPath)
@@ -133,7 +132,7 @@ async function getValidIdentities(keychain?: string | null): Promise<Array<strin
     ])
       .then(it => {
         const array = it[0].concat(it[1])
-          .filter(it => !it.includes("(Missing required extension)") && !it.includes("valid identities found") && !it.includes("iPhone ") && !it.includes("com.apple.idms.appleid.prd.") && !it.includes("Mac Developer:"))
+          .filter(it => !it.includes("(Missing required extension)") && !it.includes("valid identities found") && !it.includes("iPhone ") && !it.includes("com.apple.idms.appleid.prd."))
           // remove 1)
           .map(it => it.substring(it.indexOf(")") + 1).trim())
         return Array.from(new Set(array))
@@ -146,10 +145,11 @@ async function getValidIdentities(keychain?: string | null): Promise<Array<strin
   return result
 }
 
-async function _findIdentity(namePrefix: CertType, qualifier?: string | null, keychain?: string | null): Promise<string | null> {
+async function _findIdentity(type: CertType, qualifier?: string | null, keychain?: string | null): Promise<string | null> {
   // https://github.com/electron-userland/electron-builder/issues/484
   //noinspection SpellCheckingInspection
   const lines = await getValidIdentities(keychain)
+  const namePrefix = `${type}:`
   for (let line of lines) {
     if (qualifier != null && !line.includes(qualifier)) {
       continue
@@ -160,11 +160,15 @@ async function _findIdentity(namePrefix: CertType, qualifier?: string | null, ke
     }
   }
 
-  if (namePrefix === "Developer ID Application") {
+  if (type === "Developer ID Application") {
     // find non-Apple certificate
     // https://github.com/electron-userland/electron-builder/issues/458
     l: for (let line of lines) {
       if (qualifier != null && !line.includes(qualifier)) {
+        continue
+      }
+
+      if (line.includes("Mac Developer:")) {
         continue
       }
 
@@ -183,10 +187,12 @@ async function _findIdentity(namePrefix: CertType, qualifier?: string | null, ke
 export async function findIdentity(certType: CertType, qualifier?: string | null, keychain?: string | null): Promise<string | null> {
   let identity = process.env.CSC_NAME || qualifier
   if (isEmptyOrSpaces(identity)) {
-    if (keychain == null && process.env.CI == null && process.env.CSC_IDENTITY_AUTO_DISCOVERY === "false") {
+    if (keychain == null && !isCi() && (process.env.CSC_IDENTITY_AUTO_DISCOVERY === "false")) {
       return null
     }
-    return await _findIdentity(certType, null, keychain)
+    else {
+      return await _findIdentity(certType, null, keychain)
+    }
   }
   else {
     identity = identity.trim()

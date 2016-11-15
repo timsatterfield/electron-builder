@@ -1,8 +1,9 @@
 import { AsarOptions } from "asar-electron-builder"
 import { PlatformPackager } from "./platformPackager"
 import { MacOptions, DmgOptions, MasBuildOptions } from "./options/macOptions"
-import { PublishConfiguration, BintrayOptions } from "./options/publishOptions"
+import { Publish } from "./options/publishOptions"
 import { WinBuildOptions, NsisOptions, SquirrelWindowsOptions } from "./options/winOptions"
+import { LinuxBuildOptions } from "./options/linuxOptions"
 
 export interface Metadata {
   readonly repository?: string | RepositoryInfo | null
@@ -99,16 +100,6 @@ export interface BuildMetadata {
    */
   readonly copyright?: string | null
 
-  /*
-   Whether to package the application's source code into an archive, using [Electron's archive format](https://github.com/electron/asar). Defaults to `true`.
-   Reasons why you may want to disable this feature are described in [an application packaging tutorial in Electron's documentation](http://electron.atom.io/docs/latest/tutorial/application-packaging/#limitations-on-node-api/).
-
-   Or you can pass object of any asar options.
-
-   Node modules, that must be unpacked, will be detected automatically, you don't need to explicitly set `asar.unpackDir` - please file issue if this doesn't work.
-   */
-  readonly asar?: AsarOptions | boolean | null
-
   // deprecated
   readonly iconUrl?: string | null
 
@@ -137,6 +128,21 @@ export interface BuildMetadata {
   readonly extraFiles?: Array<string> | string | null
 
   /*
+   Whether to package the application's source code into an archive, using [Electron's archive format](http://electron.atom.io/docs/tutorial/application-packaging/). Defaults to `true`.
+   Reasons why you may want to disable this feature are described in [an application packaging tutorial in Electron's documentation](http://electron.atom.io/docs/tutorial/application-packaging/#limitations-of-the-node-api).
+
+   Or you can pass object of any asar options.
+
+   Node modules, that must be unpacked, will be detected automatically, you don't need to explicitly set `asarUnpack` - please file issue if this doesn't work.
+   */
+  readonly asar?: AsarOptions | boolean | null
+
+  /**
+   A [glob patterns](https://www.npmjs.com/package/glob#glob-primer) relative to the [app directory](#MetadataDirectories-app), which specifies which files to unpack when creating the [asar](http://electron.atom.io/docs/tutorial/application-packaging/) archive.
+   */
+  readonly asarUnpack?: Array<string> | string | null
+
+  /*
   The file associations. See [.build.fileAssociations](#FileAssociation).
    */
   readonly fileAssociations?: Array<FileAssociation> | FileAssociation
@@ -155,9 +161,6 @@ export interface BuildMetadata {
    See [.build.dmg](#DmgOptions).
    */
   readonly dmg?: DmgOptions | null
-
-  // deprecated
-  readonly osx?: MacOptions | null
 
   /*
    See [.build.mas](#MasBuildOptions).
@@ -197,14 +200,19 @@ export interface BuildMetadata {
   readonly afterPack?: (context: AfterPackContext) => Promise<any> | null
 
   /*
-   *two package.json structure only* Whether to [rebuild](https://docs.npmjs.com/cli/rebuild) native dependencies (`npm rebuild`) before starting to package the app. Defaults to `true`.
+   Whether to [rebuild](https://docs.npmjs.com/cli/rebuild) native dependencies (`npm rebuild`) before starting to package the app. Defaults to `true`.
    */
   readonly npmRebuild?: boolean
 
   /*
-   *two package.json structure only* Whether to omit using [--build-from-source](https://github.com/mapbox/node-pre-gyp#options) flag when installing app native deps. Defaults to `false`.
+   Whether to omit using [--build-from-source](https://github.com/mapbox/node-pre-gyp#options) flag when installing app native deps. Defaults to `false`.
    */
   readonly npmSkipBuildFromSource?: boolean
+
+  /*
+   Additional command line arguments to use when installing app native deps. Defaults to `null`.
+   */
+  readonly npmArgs?: Array<string> | string | null
 
   /*
    Whether to execute `node-gyp rebuild` before starting to package the app. Defaults to `false`.
@@ -226,7 +234,7 @@ export interface BuildMetadata {
   /*
   See [.build.publish](#PublishConfiguration).
    */
-  readonly publish?: string | Array<string> | PublishConfiguration | BintrayOptions | Array<PublishConfiguration> | Array<BintrayOptions> | null
+  readonly publish?: Publish
 }
 
 export interface AfterPackContext {
@@ -236,73 +244,6 @@ export interface AfterPackContext {
   readonly options: any
 
   readonly packager: PlatformPackager<any>
-}
-
-/*
- ### `.build.linux`
-
- Linux specific build options.
- */
-export interface LinuxBuildOptions extends PlatformSpecificBuildOptions {
-  /*
-   The [application category](https://specifications.freedesktop.org/menu-spec/latest/apa.html#main-category-registry).
-   */
-  readonly category?: string | null
-
-  /*
-  The [package category](https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Section). Not applicable for AppImage.
-   */
-  readonly packageCategory?: string | null
-
-  /*
-   As [description](#AppMetadata-description) from application package.json, but allows you to specify different for Linux.
-   */
-  readonly description?: string | null
-
-  /*
-   Target package type: list of `AppImage`, `deb`, `rpm`, `freebsd`, `pacman`, `p5p`, `apk`, `7z`, `zip`, `tar.xz`, `tar.lz`, `tar.gz`, `tar.bz2`, `dir`. Defaults to `AppImage`.
-
-   The most effective [xz](https://en.wikipedia.org/wiki/Xz) compression format used by default.
-
-   Only `deb` and `AppImage` is tested. Feel free to file issues for `rpm` and other package formats.
-   */
-  readonly target?: Array<string> | null
-
-  /*
-   *deb-only.* The [short description](https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Description).
-   */
-  readonly synopsis?: string | null
-
-  /*
-   The maintainer. Defaults to [author](#AppMetadata-author).
-   */
-  readonly maintainer?: string | null
-
-  /*
-   The vendor. Defaults to [author](#AppMetadata-author).
-   */
-  readonly vendor?: string | null
-
-  // should be not documented, only to experiment
-  readonly fpm?: Array<string> | null
-
-  /**
-   The [Desktop file](https://developer.gnome.org/integration-guide/stable/desktop-files.html.en) entries.
-   */
-  readonly desktop?: { [key: string]: string; } | null
-
-  readonly afterInstall?: string | null
-  readonly afterRemove?: string | null
-
-  /*
-  *deb-only.* The compression type, one of `gz`, `bzip2`, `xz`. Defaults to `xz`.
-   */
-  readonly compression?: string | null
-
-  /*
-   Package dependencies. Defaults to `["libappindicator1", "libnotify-bin"]`.
-   */
-  readonly depends?: string[] | null
 }
 
 /*
@@ -341,6 +282,8 @@ export interface FileAssociation {
  ### `.build.protocols`
 
  macOS only.
+
+ Please note — on macOS [you need to register an `open-url` event handler](http://electron.atom.io/docs/api/app/#event-open-url-macos).
  */
 export interface Protocol {
   /*
@@ -384,6 +327,8 @@ export interface PlatformSpecificBuildOptions {
   readonly extraFiles?: Array<string> | null
   readonly extraResources?: Array<string> | null
 
+  readonly asarUnpack?: Array<string> | null
+
   readonly asar?: AsarOptions | boolean
 
   readonly target?: Array<string> | null
@@ -392,7 +337,7 @@ export interface PlatformSpecificBuildOptions {
 
   readonly fileAssociations?: Array<FileAssociation> | FileAssociation
 
-  readonly publish?: string | Array<string> | PublishConfiguration | BintrayOptions | Array<PublishConfiguration> | Array<BintrayOptions> | null
+  readonly publish?: Publish
 }
 
 export class Platform {
@@ -436,7 +381,6 @@ export class Platform {
     switch (name) {
       case Platform.MAC.nodeName:
       case Platform.MAC.name:
-      case "osx":
         return Platform.MAC
 
       case Platform.WINDOWS.nodeName:

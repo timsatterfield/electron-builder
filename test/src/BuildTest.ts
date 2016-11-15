@@ -1,7 +1,7 @@
 import test from "./helpers/avaEx"
 import { assertPack, modifyPackageJson, platform, getPossiblePlatforms, app, appThrows, packageJson } from "./helpers/packTester"
 import { move, outputJson } from "fs-extra-p"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import * as path from "path"
 import { assertThat } from "./helpers/fileAssert"
 import { archFromString, BuildOptions, Platform, Arch, PackagerOptions, DIR_TARGET, createTargets } from "out"
@@ -26,7 +26,6 @@ test("cli", () => {
     return normalizeOptions(yargs.parse(input.split(" ")))
   }
 
-  assertThat(parse("--platform osx")).isEqualTo(expected({targets: Platform.MAC.createTarget()}))
   assertThat(parse("--platform mac")).isEqualTo(expected({targets: Platform.MAC.createTarget()}))
 
   const all = expected({targets: new Map([...Platform.MAC.createTarget(null, Arch.x64), ...Platform.WINDOWS.createTarget(null, Arch.x64, Arch.ia32), ...Platform.LINUX.createTarget(null, Arch.x64, Arch.ia32)])})
@@ -38,7 +37,6 @@ test("cli", () => {
   assertThat(parse("--ia32 --dir")).isEqualTo(expected({targets: Platform.current().createTarget(DIR_TARGET, Arch.ia32)}))
   assertThat(parse("--platform linux --dir")).isEqualTo(expected({targets: Platform.LINUX.createTarget(DIR_TARGET)}))
 
-  assertThat(parse("--osx")).isEqualTo(expected({targets: Platform.MAC.createTarget()}))
   assertThat(parse("--arch x64")).isEqualTo(expected({targets: Platform.current().createTarget(null, Arch.x64)}))
   assertThat(parse("--ia32 --x64")).isEqualTo(expected({targets: Platform.current().createTarget(null, Arch.x64, Arch.ia32)}))
   assertThat(parse("--linux")).isEqualTo(expected({targets: Platform.LINUX.createTarget()}))
@@ -234,7 +232,11 @@ test.ifDevOrLinuxCi("extra metadata", () => {
     foo: {
       bar: 12,
     },
-    productName: "NewName"
+    build: {
+      linux: {
+        executableName: "NewName"
+      }
+    }
   }
   return assertPack("test-app-one", {
     targets: Platform.LINUX.createTarget(DIR_TARGET),
@@ -260,7 +262,11 @@ test.ifDevOrLinuxCi("extra metadata", () => {
 
 test.ifDevOrLinuxCi("extra metadata - two", () => {
   const extraMetadata = {
-    productName: "NewName"
+    build: {
+      linux: {
+        executableName: "NewName"
+      }
+    }
   }
   return assertPack("test-app", {
     targets: Platform.LINUX.createTarget(DIR_TARGET),

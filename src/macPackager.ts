@@ -1,18 +1,20 @@
-import { PlatformPackager, BuildInfo, Target } from "./platformPackager"
+import { PlatformPackager, BuildInfo, Target, TargetEx } from "./platformPackager"
 import { Platform, Arch } from "./metadata"
 import { MasBuildOptions, MacOptions } from "./options/macOptions"
 import * as path from "path"
-import BluebirdPromise from "bluebird"
+import BluebirdPromise from "bluebird-lst-c"
 import { log, warn, task } from "./util/log"
-import { createKeychain, CodeSigningInfo, findIdentity } from "./codeSign"
+import { createKeychain, CodeSigningInfo, findIdentity, appleCertificatePrefixes } from "./codeSign"
 import { deepAssign } from "./util/deepAssign"
-import { signAsync, flatAsync, BaseSignOptions, SignOptions, FlatOptions } from "electron-osx-sign-tf"
+import { signAsync, SignOptions } from "electron-macos-sign"
 import { DmgTarget } from "./targets/dmg"
-import { createCommonTarget, DEFAULT_TARGET } from "./targets/targetFactory"
+import { createCommonTarget, DEFAULT_TARGET, DIR_TARGET } from "./targets/targetFactory"
 import { AppInfo } from "./appInfo"
+import { PkgTarget, prepareProductBuildArgs } from "./targets/pkg"
+import { exec } from "./util/util"
 
 export default class MacPackager extends PlatformPackager<MacOptions> {
-  codeSigningInfo: Promise<CodeSigningInfo>
+  readonly codeSigningInfo: Promise<CodeSigningInfo>
 
   constructor(info: BuildInfo) {
     super(info)
@@ -37,25 +39,28 @@ export default class MacPackager extends PlatformPackager<MacOptions> {
     return iconPath == null ? await this.getDefaultIcon("icns") : path.resolve(this.projectDir, iconPath)
   }
 
-  normalizePlatformSpecificBuildOptions(options: MacOptions | n): MacOptions {
-    return super.normalizePlatformSpecificBuildOptions(options == null ? (<any>this.info.devMetadata.build).osx : options)
-  }
-
   createTargets(targets: Array<string>, mapper: (name: string, factory: () => Target) => void, cleanupTasks: Array<() => Promise<any>>): void {
     for (let name of targets) {
-      if (name === "dir") {
-        continue
-      }
+      switch (name) {
+        case DIR_TARGET:
+          break
 
-      if (name === DEFAULT_TARGET) {
-        mapper("dmg", () => new DmgTarget(this))
-        mapper("zip", () => new Target("zip"))
-      }
-      else if (name === "dmg") {
-        mapper("dmg", () => new DmgTarget(this))
-      }
-      else {
-        mapper(name, () => name === "mas" ? new Target("mas") : createCommonTarget(name))
+        case DEFAULT_TARGET:
+          mapper("dmg", () => new DmgTarget(this))
+          mapper("zip", () => new Target("zip"))
+          break
+
+        case "dmg":
+          mapper("dmg", () => new DmgTarget(this))
+          break
+
+        case "pkg":
+          mapper("pkg", () => new PkgTarget(this))
+          break
+
+        default:
+          mapper(name, () => name === "mas" ? new Target(name) : createCommonTarget(name))
+          break
       }
     }
   }
@@ -73,16 +78,12 @@ export default class MacPackager extends PlatformPackager<MacOptions> {
       const appOutDir = this.computeAppOutDir(outDir, arch)
       nonMasPromise = this.doPack(outDir, appOutDir, this.platform.nodeName, arch, this.platformSpecificBuildOptions)
         .then(() => this.sign(appOutDir, null))
-        .then(() => {
-          this.packageInDistributableFormat(appOutDir, targets, postAsyncTasks)
-        })
+        .then(() => this.packageInDistributableFormat(appOutDir, targets, postAsyncTasks))
     }
 
     if (hasMas) {
-      // osx-sign - disable warning
       const appOutDir = path.join(outDir, "mas")
       const masBuildOptions = deepAssign({}, this.platformSpecificBuildOptions, (<any>this.devMetadata.build).mas)
-      //noinspection JSUnusedGlobalSymbols
       await this.doPack(outDir, appOutDir, "mas", arch, masBuildOptions)
       await this.sign(appOutDir, masBuildOptions)
     }
@@ -94,45 +95,44 @@ export default class MacPackager extends PlatformPackager<MacOptions> {
 
   private async sign(appOutDir: string, masOptions: MasBuildOptions | null): Promise<void> {
     if (process.platform !== "darwin") {
-      warn("Mac application signing not supported on this platform, skipping.")
+      warn("macOS application code signing is supported only on macOS, skipping.")
       return
     }
 
-    let keychainName = (await this.codeSigningInfo).keychainName
-    const masQualifier = masOptions == null ? null : (masOptions.identity || this.platformSpecificBuildOptions.identity)
+    const keychainName = (await this.codeSigningInfo).keychainName
+    const isMas = masOptions != null
+    const masQualifier = isMas ? (masOptions!!.identity || this.platformSpecificBuildOptions.identity) : null
 
-    let name = await findIdentity(masOptions == null ? "Developer ID Application" : "3rd Party Mac Developer Application", masOptions == null ? this.platformSpecificBuildOptions.identity : masQualifier, keychainName)
+    let name = await findIdentity(isMas ? "3rd Party Mac Developer Application" : "Developer ID Application", isMas ? masQualifier : this.platformSpecificBuildOptions.identity, keychainName)
     if (name == null) {
-      let message = "App is not signed: CSC_LINK is not specified, and no valid identity in the keychain, see https://github.com/electron-userland/electron-builder/wiki/Code-Signing"
-      if (masOptions == null) {
-        message += `\nMust be "Developer ID Application:" or custom non-Apple code signing certificate`
-        warn(message)
-        return
+      if (!isMas) {
+        name = await findIdentity("Mac Developer", this.platformSpecificBuildOptions.identity, keychainName)
+        if (name != null) {
+          warn("Mac Developer is used to sign app — it is only for development and testing, not for production")
+        }
       }
-      else {
-        message += `\nMust be "3rd Party Mac Developer Application:" and "3rd Party Mac Developer Installer:"`
-        throw new Error(message)
+
+      if (name == null) {
+        let message = `App is not signed: cannot find valid ${isMas ? '"3rd Party Mac Developer Application" identity' : `"Developer ID Application" identity or custom non-Apple code signing certificate`}, see https://github.com/electron-userland/electron-builder/wiki/Code-Signing`
+        if (isMas) {
+          throw new Error(message)
+        }
+        else {
+          warn(message)
+          return
+        }
       }
     }
 
-    let installerName: string | null = null
-    if (masOptions != null) {
-      installerName = await findIdentity("3rd Party Mac Developer Installer", masQualifier, keychainName)
-      if (installerName == null) {
-        throw new Error("Cannot find valid installer certificate: CSC_LINK is not specified, and no valid identity in the keychain, see https://github.com/electron-userland/electron-builder/wiki/Code-Signing")
-      }
-    }
-
-    const baseSignOptions: BaseSignOptions = {
-      app: path.join(appOutDir, `${this.appInfo.productFilename}.app`),
-      platform: masOptions == null ? "darwin" : "mas",
+    const appPath = path.join(appOutDir, `${this.appInfo.productFilename}.app`)
+    const signOptions: any = {
+      identity: name!,
+      platform: isMas ? "mas" : "darwin",
+      version: this.info.electronVersion,
+      app: appPath,
       keychain: keychainName || undefined,
-      version: this.info.electronVersion
+      "gatekeeper-assess": appleCertificatePrefixes.find(it => name!.startsWith(it)) != null
     }
-
-    const signOptions = Object.assign({
-      identity: name,
-    }, (<any>this.devMetadata.build)["osx-sign"], baseSignOptions)
 
     const resourceList = await this.resourceList
     if (resourceList.includes(`entitlements.osx.plist`)) {
@@ -143,36 +143,48 @@ export default class MacPackager extends PlatformPackager<MacOptions> {
     }
 
     const customSignOptions = masOptions || this.platformSpecificBuildOptions
-    if (customSignOptions.entitlements != null) {
-      signOptions.entitlements = customSignOptions.entitlements
-    }
-    else {
-      const p = `entitlements.${masOptions == null ? "mac" : "mas"}.plist`
+    if (customSignOptions.entitlements == null) {
+      const p = `entitlements.${isMas ? "mas" : "mac"}.plist`
       if (resourceList.includes(p)) {
         signOptions.entitlements = path.join(this.buildResourcesDir, p)
       }
     }
-
-    if (customSignOptions.entitlementsInherit != null) {
-      signOptions["entitlements-inherit"] = customSignOptions.entitlementsInherit
-    }
     else {
-      const p = `entitlements.${masOptions == null ? "mac" : "mas"}.inherit.plist`
+      signOptions.entitlements = customSignOptions.entitlements
+    }
+
+    if (customSignOptions.entitlementsInherit == null) {
+      const p = `entitlements.${isMas ? "mas" : "mac"}.inherit.plist`
       if (resourceList.includes(p)) {
         signOptions["entitlements-inherit"] = path.join(this.buildResourcesDir, p)
       }
+    }
+    else {
+      signOptions["entitlements-inherit"] = customSignOptions.entitlementsInherit
     }
 
     await task(`Signing app (identity: ${name})`, this.doSign(signOptions))
 
     if (masOptions != null) {
-      await task(`Signing app (identity: ${name})`, this.doSign(signOptions))
       const pkg = path.join(appOutDir, `${this.appInfo.productFilename}-${this.appInfo.version}.pkg`)
-      await this.doFlat(Object.assign({
-        pkg: pkg,
-        identity: installerName,
-      }, baseSignOptions))
+      await this.doFlat(appPath, pkg, await this.findInstallerIdentity(true, keychainName), keychainName)
       this.dispatchArtifactCreated(pkg, `${this.appInfo.name}-${this.appInfo.version}.pkg`)
+    }
+  }
+
+  async findInstallerIdentity(isMas: boolean, keychainName: string | n): Promise<string> {
+    const targetSpecificOptions: MacOptions = (<any>this.devMetadata.build)[isMas ? "mas" : "pkg"] || this.platformSpecificBuildOptions
+    const name = isMas ? "3rd Party Mac Developer Installer" : "Developer ID Installer"
+    let installerName = await findIdentity(name, targetSpecificOptions.identity, keychainName)
+    if (installerName != null) {
+      return installerName
+    }
+
+    if (isMas) {
+      throw new Error(`Cannot find valid "${name}" identity to sign MAS installer, see https://github.com/electron-userland/electron-builder/wiki/Code-Signing`)
+    }
+    else {
+      throw new Error(`Cannot find valid "${name}" to sign standalone installer, see https://github.com/electron-userland/electron-builder/wiki/Code-Signing`)
     }
   }
 
@@ -182,18 +194,20 @@ export default class MacPackager extends PlatformPackager<MacOptions> {
   }
 
   //noinspection JSMethodCanBeStatic
-  protected async doFlat(opts: FlatOptions): Promise<any> {
-    return flatAsync(opts)
+  protected async doFlat(appPath: string, outFile: string, identity: string, keychain: string | n): Promise<any> {
+    const args = prepareProductBuildArgs(appPath, identity, keychain)
+    args.push(outFile)
+    return exec("productbuild", args)
   }
 
   protected packageInDistributableFormat(appOutDir: string, targets: Array<Target>, promises: Array<Promise<any>>): void {
     for (let t of targets) {
       const target = t.name
-      if (t instanceof DmgTarget) {
-        promises.push(t.build(appOutDir))
+      if (t instanceof TargetEx) {
+        promises.push(t.build(appOutDir, Arch.x64))
       }
       else if (target !== "mas") {
-        log(`Creating MacOS ${target}`)
+        log(`Building macOS ${target}`)
         // we use app name here - see https://github.com/electron-userland/electron-builder/pull/204
         const outFile = path.join(appOutDir, this.generateName2(target, "mac", false))
         promises.push(this.archiveApp(target, appOutDir, outFile)
